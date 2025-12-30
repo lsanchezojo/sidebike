@@ -25,11 +25,7 @@
 
 #define PAIRING_WINDOW_MS 120000
 
-// ==================== IP5306 (Batería) ====================
-#define IP5306_ADDR         0x75
-#define IP5306_REG_READ0    0x70
-#define IP5306_REG_READ1    0x71
-#define IP5306_REG_READ2    0x78
+
 
 // ==================== DISPLAY ====================
 U8G2_SH1106_128X64_NONAME_F_HW_I2C display(U8G2_R0, U8X8_PIN_NONE);
@@ -70,15 +66,12 @@ struct tm timeInfo;
 bool timeSet = false;
 const char* diasSemana[] = {"dom", "lun", "mar", "mie", "jue", "vie", "sab"};
 
-// Batería
-int batteryLevel = -1;  // -1 = no detectado, 0-100 = nivel
-unsigned long lastBatteryRead = 0;
+
 
 // ==================== FORWARD DECLARATIONS ====================
 void beep(int ms);
 void processMessage(String msg);
-int readBatteryLevel();
-void drawBatteryIcon(int level);
+
 
 
 
@@ -165,65 +158,7 @@ void playStartupMelody() {
   noTone(BUZZER_PIN);
 }
 
-// ==================== BATERÍA (IP5306) ====================
-int readBatteryLevel() {
-  Wire.beginTransmission(IP5306_ADDR);
-  Wire.write(IP5306_REG_READ2);
-  if (Wire.endTransmission(false) != 0) {
-    return -1;  // IP5306 no encontrado
-  }
-  
-  Wire.requestFrom(IP5306_ADDR, 1);
-  if (Wire.available()) {
-    uint8_t data = Wire.read();
-    // Los bits 4-7 indican el nivel (4 LEDs del power bank)
-    // Cada bit representa un LED encendido
-    uint8_t level = (data >> 4) & 0x0F;
-    
-    // Convertir a porcentaje
-    switch (level) {
-      case 0x0F: return 100;  // 4 LEDs
-      case 0x07: return 75;   // 3 LEDs
-      case 0x03: return 50;   // 2 LEDs
-      case 0x01: return 25;   // 1 LED
-      default:   return 0;    // 0 LEDs (batería baja)
-    }
-  }
-  return -1;
-}
 
-void drawBatteryIcon(int level) {
-  // Icono de batería en esquina superior izquierda
-  // Dimensiones: 12x6 píxeles (2/3 del tamaño original)
-  int x = 1;
-  int y = 1;
-  int w = 12;
-  int h = 6;
-  
-  // Contorno de la batería
-  display.drawFrame(x, y, w, h);
-  // Polo positivo
-  display.drawBox(x + w, y + 1, 1, 3);
-  
-  if (level < 0) {
-    // IP5306 no detectado - dibujar X
-    display.drawLine(x + 1, y + 1, x + w - 2, y + h - 2);
-    display.drawLine(x + 1, y + h - 2, x + w - 2, y + 1);
-  } else {
-    // Calcular ancho del relleno según nivel
-    int fillW = ((w - 2) * level) / 100;
-    if (fillW > 0) {
-      display.drawBox(x + 1, y + 1, fillW, h - 2);
-    }
-    
-    // Si batería muy baja, parpadear
-    if (level <= 25 && (millis() / 500) % 2 == 0) {
-      display.setDrawColor(0);
-      display.drawBox(x + 1, y + 1, w - 2, h - 2);
-      display.setDrawColor(1);
-    }
-  }
-}
 
 // ==================== PROCESAMIENTO ====================
 void processMessage(String msg) {
@@ -237,7 +172,6 @@ void processMessage(String msg) {
 
   int p = msg.indexOf('|');
   String cmd = (p > 0) ? msg.substring(0, p) : msg;
-  Serial.println("cmd: " + cmd);
   
   if (cmd == "NAV") {
     // Formato: NAV|icono|distancia|calle|eta
@@ -262,18 +196,13 @@ void processMessage(String msg) {
   }
   else if (cmd == "TIME") {
     int p1 = msg.indexOf('|');
-    Serial.println("p1: " + String(p1));
     int p2 = msg.indexOf('|', p1 + 1);
-    Serial.println("p2: " + String(p2));
     
     if (p1 > 0 && p2 > p1) {
       // Formato esperado: TIME|DD/MM/YYYY|HH:MM:SS
       String dateStr = msg.substring(p1 + 1, p2);
       String timeStr = msg.substring(p2 + 1);
       
-      Serial.println("dateStr: " + dateStr);
-      Serial.println("timeStr: " + timeStr);
-
       timeInfo.tm_mday = dateStr.substring(0, 2).toInt();
       timeInfo.tm_mon = dateStr.substring(3, 5).toInt() - 1;
       
@@ -348,7 +277,7 @@ void processMessage(String msg) {
 // ==================== DISPLAY ====================
 void showClock() {
   display.clearBuffer();
-  drawBatteryIcon(batteryLevel);
+
 
   if (!timeSet) {
     display.setFont(u8g2_font_ncenB14_te);
@@ -487,10 +416,8 @@ void showNavigation() {
 
 void showNotification() {
   display.clearBuffer();
-  drawBatteryIcon(batteryLevel);
-  
-  // Línea separadora superior (debajo del icono de batería)
-  display.drawHLine(0, 10, 128);
+  // Línea separadora superior
+  display.drawHLine(0, 3, 128);
   
   // Nombre del remitente (grande, arriba)
   display.setFont(u8g2_font_ncenB12_te);
@@ -566,7 +493,7 @@ void showNotification() {
 
 void showPairing() {
   display.clearBuffer();
-  drawBatteryIcon(batteryLevel);
+
   display.setFont(u8g2_font_ncenB10_te);
   display.drawStr(25, 20, "SIDEBIKE");
   display.setFont(u8g2_font_ncenB08_te);
@@ -643,9 +570,7 @@ void setup() {
 
   setupBLE();
 
-  // Lectura inicial de batería
-  batteryLevel = readBatteryLevel();
-  Serial.printf("Batería: %d%%\n", batteryLevel);
+
 
   startTime = millis();
   currentState = STATE_PAIRING;
@@ -654,11 +579,7 @@ void setup() {
 
 // ==================== LOOP ====================
 void loop() {
-  // Leer batería cada 30 segundos
-  if (millis() - lastBatteryRead >= 30000) {
-    lastBatteryRead = millis();
-    batteryLevel = readBatteryLevel();
-  }
+
 
   // Timeout de pairing (solo afecta al mensaje en pantalla)
   if (pairingMode && (millis() - startTime > PAIRING_WINDOW_MS)) {
