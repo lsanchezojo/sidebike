@@ -1,0 +1,777 @@
+/*
+ * SIDEBIKE - ESP32-C3 Navigation Display
+ *
+ * BLE implementado como ChronosESP32 (2 características TX/RX)
+ * Compatible con Tasker + BLE Tasker Plugin
+ */
+
+#include <Wire.h>
+#include <U8g2lib.h>
+#include <NimBLEDevice.h>
+#include <time.h>
+#include "images.h"
+
+// ==================== PINES ====================
+#define SDA_PIN 20
+#define SCL_PIN 21
+#define TOUCH_PIN 1
+#define BUZZER_PIN 2
+
+// ==================== BLE UUIDs ====================
+#define DEVICE_NAME "SIDEBIKE"
+#define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
+#define CHAR_UUID_TX        "beb5483e-36e1-4688-b7f5-ea07361b26a8"  // Para enviar (NOTIFY)
+#define CHAR_UUID_RX        "beb5483e-36e1-4688-b7f5-ea07361b26a9"  // Para recibir (WRITE)
+
+#define PAIRING_WINDOW_MS 120000
+
+// ==================== IP5306 (Batería) ====================
+#define IP5306_ADDR         0x75
+#define IP5306_REG_READ0    0x70
+#define IP5306_REG_READ1    0x71
+#define IP5306_REG_READ2    0x78
+
+// ==================== DISPLAY ====================
+U8G2_SH1106_128X64_NONAME_F_HW_I2C display(U8G2_R0, U8X8_PIN_NONE);
+
+// ==================== VARIABLES ====================
+enum DeviceState { STATE_CLOCK, STATE_NAVIGATION, STATE_PAIRING, STATE_NOTIFICATION };
+DeviceState currentState = STATE_PAIRING;
+
+NimBLEServer* pServer = nullptr;
+NimBLECharacteristic* pCharTX = nullptr;
+NimBLECharacteristic* pCharRX = nullptr;
+bool deviceConnected = false;
+bool pairingMode = true;
+unsigned long startTime = 0;
+
+// Buffer para datos recibidos
+volatile bool newData = false;
+String receivedData = "";
+
+// Navegación
+String navIcon = "";
+String navDistance = "";
+String navStreet = "";
+String navETA = "";  // Tiempo restante al destino
+bool navActive = false;
+
+// Notificaciones de apps
+String notifApp = "";       // Nombre de la app (WhatsApp, Telegram, etc.)
+String notifSender = "";    // Remitente del mensaje
+String notifMessage = "";   // Contenido del mensaje
+String notifTime = "";      // Hora de la notificación
+bool notifActive = false;   // Hay notificación pendiente
+unsigned long notifStartTime = 0;  // Tiempo cuando se mostró la notificación
+DeviceState stateBeforeNotif = STATE_CLOCK;  // Estado al que volver después de notif
+
+// Tiempo
+struct tm timeInfo;
+bool timeSet = false;
+const char* diasSemana[] = {"dom", "lun", "mar", "mie", "jue", "vie", "sab"};
+
+// Batería
+int batteryLevel = -1;  // -1 = no detectado, 0-100 = nivel
+unsigned long lastBatteryRead = 0;
+
+// ==================== FORWARD DECLARATIONS ====================
+void beep(int ms);
+void processMessage(String msg);
+int readBatteryLevel();
+void drawBatteryIcon(int level);
+
+
+
+// ==================== UTF-8 A LATIN-1 ====================
+// Convierte UTF-8 a ISO-8859-1 para que las fuentes _te muestren acentos
+String utf8ToLatin1(String utf8) {
+  String result = "";
+  for (int i = 0; i < utf8.length(); i++) {
+    uint8_t c = utf8.charAt(i);
+    if (c < 0x80) {
+      result += (char)c;
+    } else if (c == 0xC2) {
+      // Caracteres 0x80-0xBF (ej: °, ², etc.)
+      if (i + 1 < utf8.length()) {
+        result += (char)utf8.charAt(++i);
+      }
+    } else if (c == 0xC3) {
+      // Caracteres latinos acentuados (á=0xC3 0xA1 -> 0xE1)
+      if (i + 1 < utf8.length()) {
+        result += (char)(utf8.charAt(++i) + 0x40);
+      }
+    } else if (c >= 0xC4) {
+      // Otros caracteres multibyte - saltar
+      if (i + 1 < utf8.length()) i++;
+    }
+  }
+  return result;
+}
+
+// ==================== CALLBACKS ====================
+// Clase que hereda de ambos callbacks (como ChronosESP32)
+class MyCallbacks : public NimBLEServerCallbacks, public NimBLECharacteristicCallbacks {
+public:
+  void onConnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo) override {
+    deviceConnected = true;
+    Serial.println(">>> CONECTADO!");
+    Serial.printf("    Peer: %s\n", connInfo.getAddress().toString().c_str());
+    beep(100);
+    if (currentState == STATE_PAIRING) {
+      pairingMode = false;
+      currentState = STATE_CLOCK;
+    }
+  }
+
+  void onDisconnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo, int reason) override {
+    deviceConnected = false;
+    Serial.printf(">>> DESCONECTADO (reason: %d)\n", reason);
+    if (pairingMode) {
+      NimBLEDevice::startAdvertising();
+    }
+  }
+
+  void onWrite(NimBLECharacteristic* pChar, NimBLEConnInfo& connInfo) override {
+    Serial.println(">>> WRITE RECIBIDO!");
+    NimBLEAttValue value = pChar->getValue();
+    if (value.length() > 0) {
+      receivedData = String((char*)value.data(), value.length());
+      newData = true;
+      Serial.println("    Datos: [" + receivedData + "]");
+    }
+  }
+};
+
+MyCallbacks* callbacks = nullptr;
+
+// ==================== BUZZER ====================
+void beep(int ms) {
+  digitalWrite(BUZZER_PIN, HIGH);
+  delay(ms);
+  digitalWrite(BUZZER_PIN, LOW);
+}
+
+// Melodía de inicio tipo Mario Bros
+void playStartupMelody() {
+  // Notas: E5, E5, E5, C5, E5, G5, G4
+  int melody[] = {659, 659, 659, 523, 659, 784, 392};
+  int durations[] = {150, 150, 150, 150, 150, 300, 300};
+  int pauses[] = {130, 130, 200, 100, 180, 200, 0};
+  
+  for (int i = 0; i < 7; i++) {
+    tone(BUZZER_PIN, melody[i], durations[i]);
+    delay(durations[i] + pauses[i]);
+  }
+  noTone(BUZZER_PIN);
+}
+
+// ==================== BATERÍA (IP5306) ====================
+int readBatteryLevel() {
+  Wire.beginTransmission(IP5306_ADDR);
+  Wire.write(IP5306_REG_READ2);
+  if (Wire.endTransmission(false) != 0) {
+    return -1;  // IP5306 no encontrado
+  }
+  
+  Wire.requestFrom(IP5306_ADDR, 1);
+  if (Wire.available()) {
+    uint8_t data = Wire.read();
+    // Los bits 4-7 indican el nivel (4 LEDs del power bank)
+    // Cada bit representa un LED encendido
+    uint8_t level = (data >> 4) & 0x0F;
+    
+    // Convertir a porcentaje
+    switch (level) {
+      case 0x0F: return 100;  // 4 LEDs
+      case 0x07: return 75;   // 3 LEDs
+      case 0x03: return 50;   // 2 LEDs
+      case 0x01: return 25;   // 1 LED
+      default:   return 0;    // 0 LEDs (batería baja)
+    }
+  }
+  return -1;
+}
+
+void drawBatteryIcon(int level) {
+  // Icono de batería en esquina superior izquierda
+  // Dimensiones: 12x6 píxeles (2/3 del tamaño original)
+  int x = 1;
+  int y = 1;
+  int w = 12;
+  int h = 6;
+  
+  // Contorno de la batería
+  display.drawFrame(x, y, w, h);
+  // Polo positivo
+  display.drawBox(x + w, y + 1, 1, 3);
+  
+  if (level < 0) {
+    // IP5306 no detectado - dibujar X
+    display.drawLine(x + 1, y + 1, x + w - 2, y + h - 2);
+    display.drawLine(x + 1, y + h - 2, x + w - 2, y + 1);
+  } else {
+    // Calcular ancho del relleno según nivel
+    int fillW = ((w - 2) * level) / 100;
+    if (fillW > 0) {
+      display.drawBox(x + 1, y + 1, fillW, h - 2);
+    }
+    
+    // Si batería muy baja, parpadear
+    if (level <= 25 && (millis() / 500) % 2 == 0) {
+      display.setDrawColor(0);
+      display.drawBox(x + 1, y + 1, w - 2, h - 2);
+      display.setDrawColor(1);
+    }
+  }
+}
+
+// ==================== PROCESAMIENTO ====================
+void processMessage(String msg) {
+  msg.trim();
+  
+  // Eliminar corchetes si existen
+  if (msg.startsWith("[")) msg = msg.substring(1);
+  if (msg.endsWith("]")) msg = msg.substring(0, msg.length() - 1);
+  
+  Serial.println("Procesando: [" + msg + "]");
+
+  int p = msg.indexOf('|');
+  String cmd = (p > 0) ? msg.substring(0, p) : msg;
+  Serial.println("cmd: " + cmd);
+  
+  if (cmd == "NAV") {
+    // Formato: NAV|icono|distancia|calle|eta
+    int p1 = msg.indexOf('|');
+    int p2 = msg.indexOf('|', p1 + 1);
+    int p3 = msg.indexOf('|', p2 + 1);
+    int p4 = msg.indexOf('|', p3 + 1);
+    if (p1 > 0 && p2 > p1) {
+      navIcon = msg.substring(p1 + 1, p2);
+      navDistance = (p3 > p2) ? msg.substring(p2 + 1, p3) : msg.substring(p2 + 1);
+      navStreet = (p3 > p2 && p4 > p3) ? msg.substring(p3 + 1, p4) : (p3 > p2) ? msg.substring(p3 + 1) : "";
+      navETA = (p4 > p3) ? msg.substring(p4 + 1) : "";
+      
+      // Si algún valor contiene % (variable Tasker no resuelta), mostrar "-"
+      if (navDistance.indexOf('%') >= 0) navDistance = "-";
+      if (navStreet.indexOf('%') >= 0) navStreet = "-";
+      if (navETA.indexOf('%') >= 0) navETA = "";
+    }
+    navActive = true;
+    currentState = STATE_NAVIGATION;
+    beep(50);
+  }
+  else if (cmd == "TIME") {
+    int p1 = msg.indexOf('|');
+    Serial.println("p1: " + String(p1));
+    int p2 = msg.indexOf('|', p1 + 1);
+    Serial.println("p2: " + String(p2));
+    
+    if (p1 > 0 && p2 > p1) {
+      // Formato esperado: TIME|DD/MM/YYYY|HH:MM:SS
+      String dateStr = msg.substring(p1 + 1, p2);
+      String timeStr = msg.substring(p2 + 1);
+      
+      Serial.println("dateStr: " + dateStr);
+      Serial.println("timeStr: " + timeStr);
+
+      timeInfo.tm_mday = dateStr.substring(0, 2).toInt();
+      timeInfo.tm_mon = dateStr.substring(3, 5).toInt() - 1;
+      
+      // Soportar año corto (YY) o largo (YYYY)
+      int year = dateStr.substring(6).toInt();
+      if (year < 100) year += 2000;  // 25 -> 2025
+      timeInfo.tm_year = year - 1900;
+      timeInfo.tm_hour = timeStr.substring(0, 2).toInt();
+      timeInfo.tm_min = timeStr.substring(3, 5).toInt();
+      timeInfo.tm_sec = timeStr.substring(6, 8).toInt();
+
+      mktime(&timeInfo);
+      timeSet = true;
+      Serial.println(">>> HORA ESTABLECIDA!");
+      Serial.printf("    Fecha: %02d/%02d/%04d\n", timeInfo.tm_mday, timeInfo.tm_mon + 1, timeInfo.tm_year + 1900);
+      Serial.printf("    Hora: %02d:%02d:%02d\n", timeInfo.tm_hour, timeInfo.tm_min, timeInfo.tm_sec);
+    } else {
+      Serial.println("ERROR: Formato TIME invalido");
+    }
+  }
+  else if (cmd == "NOTIF") {
+    // Formato: NOTIF|app|remitente|mensaje|hora
+    // Ejemplo: NOTIF|WhatsApp|Mamá|Hola, ¿cómo estás?|10:30
+    int p1 = msg.indexOf('|');
+    int p2 = msg.indexOf('|', p1 + 1);
+    int p3 = msg.indexOf('|', p2 + 1);
+    int p4 = msg.indexOf('|', p3 + 1);
+    
+    if (p1 > 0 && p2 > p1 && p3 > p2) {
+      notifApp = msg.substring(p1 + 1, p2);
+      notifSender = msg.substring(p2 + 1, p3);
+      notifMessage = (p4 > p3) ? msg.substring(p3 + 1, p4) : msg.substring(p3 + 1);
+      notifTime = (p4 > p3) ? msg.substring(p4 + 1) : "";
+      
+      // Si no hay hora, usar la hora actual
+      if (notifTime.length() == 0 && timeSet) {
+        char timeBuf[6];
+        sprintf(timeBuf, "%02d:%02d", timeInfo.tm_hour, timeInfo.tm_min);
+        notifTime = String(timeBuf);
+      }
+      
+      // Guardar estado actual para volver después
+      stateBeforeNotif = currentState;
+      notifStartTime = millis();
+      
+      notifActive = true;
+      currentState = STATE_NOTIFICATION;
+      beep(100);
+      delay(50);
+      beep(100);  // Doble beep para notificación
+      Serial.println(">>> NOTIFICACION RECIBIDA");
+      Serial.printf("    App: %s\n", notifApp.c_str());
+      Serial.printf("    De: %s\n", notifSender.c_str());
+      Serial.printf("    Msg: %s\n", notifMessage.c_str());
+    }
+  }
+  else if (cmd == "END") {
+    Serial.println("cmd2: " + cmd);
+    navActive = false;
+    notifActive = false;
+    currentState = STATE_CLOCK;
+    beep(100);
+  }
+  else if (cmd == "DISMISS") {
+    // Descartar notificación actual
+    notifActive = false;
+    currentState = STATE_CLOCK;
+    Serial.println(">>> NOTIFICACION DESCARTADA");
+  }
+}
+
+// ==================== DISPLAY ====================
+void showClock() {
+  display.clearBuffer();
+  drawBatteryIcon(batteryLevel);
+
+  if (!timeSet) {
+    display.setFont(u8g2_font_ncenB14_te);
+    display.drawStr(10, 35, "Sin hora");
+    display.setFont(u8g2_font_ncenB08_te);
+    display.drawStr(5, 55, "Envia TIME desde Tasker");
+  } else {
+    static unsigned long lastUpdate = 0;
+    if (millis() - lastUpdate >= 1000) {
+      lastUpdate = millis();
+      timeInfo.tm_sec++;
+      mktime(&timeInfo);
+    }
+
+    char buf[10];
+    sprintf(buf, "%02d:%02d", timeInfo.tm_hour, timeInfo.tm_min);
+    display.setFont(u8g2_font_logisoso32_tn);
+    int w = display.getStrWidth(buf);
+    display.drawStr((128 - w) / 2, 40, buf);
+
+    char date[25];
+    sprintf(date, "%s %02d/%02d/%04d", diasSemana[timeInfo.tm_wday],
+            timeInfo.tm_mday, timeInfo.tm_mon + 1, timeInfo.tm_year + 1900);
+    display.setFont(u8g2_font_ncenB08_te);
+    w = display.getStrWidth(date);
+    display.drawStr((128 - w) / 2, 58, date);
+  }
+
+  // Indicador conexión
+  if (deviceConnected) {
+    display.drawDisc(120, 8, 4);
+  } else {
+    display.drawCircle(120, 8, 4);
+  }
+
+  display.sendBuffer();
+}
+
+void showNavigation() {
+  display.clearBuffer();
+
+  // Área de la flecha: ajustada para centrar mejor
+  int arrowX = 2;   // Más a la izquierda
+  int arrowY = 6;   // Más arriba
+  
+  // Dibujar flecha según MD5 usando bitmaps
+  if (navIcon == "13e68aacc62531a385e2b3e9705e0701") {
+    // Flecha "continuar recto" (con cuerpo discontinuo)
+    display.drawXBMP(arrowX, arrowY, NAV_ARROW_W, NAV_ARROW_H, nav_arrow_ahead);
+  }
+  else if (navIcon == "3cc9cfaca8339431dfa25b4d26337d38") {
+    // Flecha "recta continua"
+    display.drawXBMP(arrowX, arrowY, NAV_ARROW_W, NAV_ARROW_H, nav_arrow_straight);
+  }
+  else if (navIcon == "1608d2493a2650b2aa05f0f11588d8be") {
+    // Flecha "girar derecha"
+    display.drawXBMP(arrowX, arrowY, NAV_ARROW_W, NAV_ARROW_H, nav_arrow_right);
+  }
+  else if (navIcon == "0ad898f6410fe51971fe1b7159994f26") {
+    // Flecha "girar izquierda"
+    display.drawXBMP(arrowX, arrowY, NAV_ARROW_W, NAV_ARROW_H, nav_arrow_left);
+  }
+  else if (navIcon == "5710fb9ddabf6d18b95e424783ca8fae") {
+    // Flecha "girar leve derecha"
+    display.drawXBMP(arrowX, arrowY, NAV_ARROW_W, NAV_ARROW_H, nav_arrow_right_light);
+  }
+  else if (navIcon == "627c26a2d87e696a2b73d624145235a8") {
+    // Flecha "rotonda con salida izquierda"
+    display.drawXBMP(arrowX, arrowY, NAV_ARROW_W, NAV_ARROW_H, nav_arrow_round_left);
+  }
+  else {
+    // Flecha por defecto para MD5 no reconocidos
+    display.drawXBMP(arrowX, arrowY, NAV_ARROW_W, NAV_ARROW_H, nav_arrow_ahead);
+  }
+
+  // Nombre de calle a la derecha (convertir UTF-8 a Latin-1)
+  display.setFont(u8g2_font_ncenB10_te);
+  int maxWidth = 90;
+  int xText = 36;
+  int yText = 16;
+  int lineHeight = 14;
+  
+  String street = utf8ToLatin1(navStreet);  // Convertir acentos
+  int currentLine = 0;
+  int maxLines = 3;
+  
+  while (street.length() > 0 && currentLine < maxLines) {
+    String line = "";
+    int lastSpace = -1;
+    
+    for (int i = 0; i < street.length(); i++) {
+      String testLine = line + street.charAt(i);
+      if (display.getStrWidth(testLine.c_str()) > maxWidth) {
+        if (lastSpace > 0) {
+          line = street.substring(0, lastSpace);
+          street = street.substring(lastSpace + 1);
+        } else {
+          line = street.substring(0, i);
+          street = street.substring(i);
+        }
+        break;
+      }
+      if (street.charAt(i) == ' ') lastSpace = i;
+      line = testLine;
+      if (i == street.length() - 1) {
+        street = "";
+      }
+    }
+    
+    display.drawStr(xText, yText + (currentLine * lineHeight), line.c_str());
+    currentLine++;
+  }
+
+  // Distancia abajo a la izquierda
+  display.setFont(u8g2_font_ncenB10_te);
+  String dist = utf8ToLatin1(navDistance);
+  display.drawStr(2, 50, dist.c_str());
+
+  // ETA centrado abajo (tamaño similar a la fecha del reloj)
+  if (navETA.length() > 0) {
+    display.setFont(u8g2_font_ncenB08_te);
+    String eta = navETA;
+    // Eliminar "Llegada" del texto
+    eta.replace("Llegada: ", "");
+    eta.replace("Llegada:", "");
+    eta.replace("Llegada ", "");
+    eta.replace("Llegada", "");
+    eta.trim();
+    eta = utf8ToLatin1(eta);
+    int w = display.getStrWidth(eta.c_str());
+    display.drawStr((128 - w) / 2, 63, eta.c_str());
+  }
+
+  display.sendBuffer();
+}
+
+void showNotification() {
+  display.clearBuffer();
+  drawBatteryIcon(batteryLevel);
+  
+  // Línea separadora superior (debajo del icono de batería)
+  display.drawHLine(0, 10, 128);
+  
+  // Nombre del remitente (grande, arriba)
+  display.setFont(u8g2_font_ncenB12_te);
+  String sender = utf8ToLatin1(notifSender);
+  
+  // Truncar si es muy largo
+  int maxSenderWidth = 126;
+  while (display.getStrWidth(sender.c_str()) > maxSenderWidth && sender.length() > 0) {
+    sender = sender.substring(0, sender.length() - 1);
+  }
+  display.drawStr(1, 24, sender.c_str());
+  
+  // Mensaje (más pequeño, multilínea)
+  display.setFont(u8g2_font_ncenB08_te);
+  String message = utf8ToLatin1(notifMessage);
+  int maxWidth = 126;
+  int xText = 1;
+  int yText = 36;
+  int lineHeight = 10;
+  int currentLine = 0;
+  int maxLines = 2;  // 2 líneas para el mensaje
+  
+  while (message.length() > 0 && currentLine < maxLines) {
+    String line = "";
+    int lastSpace = -1;
+    
+    for (int i = 0; i < (int)message.length(); i++) {
+      String testLine = line + message.charAt(i);
+      if (display.getStrWidth(testLine.c_str()) > maxWidth) {
+        if (lastSpace > 0) {
+          line = message.substring(0, lastSpace);
+          message = message.substring(lastSpace + 1);
+        } else {
+          line = message.substring(0, i);
+          message = message.substring(i);
+        }
+        break;
+      }
+      if (message.charAt(i) == ' ') lastSpace = i;
+      line = testLine;
+      if (i == (int)message.length() - 1) {
+        message = "";
+      }
+    }
+    
+    display.drawStr(xText, yText + (currentLine * lineHeight), line.c_str());
+    currentLine++;
+  }
+  
+  // Línea separadora inferior
+  display.drawHLine(0, 53, 128);
+  
+  // Nombre de la app (abajo izquierda) y hora (abajo derecha)
+  display.setFont(u8g2_font_ncenB08_te);
+  String app = utf8ToLatin1(notifApp);
+  display.drawStr(1, 63, app.c_str());
+  
+  // Hora a la derecha
+  if (notifTime.length() > 0) {
+    int timeWidth = display.getStrWidth(notifTime.c_str());
+    display.drawStr(127 - timeWidth, 63, notifTime.c_str());
+  }
+  
+  // Indicador de conexión
+  if (deviceConnected) {
+    display.drawDisc(120, 5, 3);
+  } else {
+    display.drawCircle(120, 5, 3);
+  }
+  
+  display.sendBuffer();
+}
+
+void showPairing() {
+  display.clearBuffer();
+  drawBatteryIcon(batteryLevel);
+  display.setFont(u8g2_font_ncenB10_te);
+  display.drawStr(25, 20, "SIDEBIKE");
+  display.setFont(u8g2_font_ncenB08_te);
+  display.drawStr(15, 38, "Buscando...");
+
+  unsigned long rem = (PAIRING_WINDOW_MS - (millis() - startTime)) / 1000;
+  char buf[20];
+  sprintf(buf, "%lus restantes", rem);
+  display.drawStr(25, 55, buf);
+
+  display.sendBuffer();
+}
+
+// ==================== SETUP BLE ====================
+void setupBLE() {
+  Serial.println("Iniciando BLE (estilo Chronos)...");
+
+  NimBLEDevice::init(DEVICE_NAME);
+  NimBLEDevice::setMTU(517);  // MTU grande como Chronos
+
+  pServer = NimBLEDevice::createServer();
+  callbacks = new MyCallbacks();
+  pServer->setCallbacks(callbacks);
+
+  NimBLEService* pService = pServer->createService(SERVICE_UUID);
+
+  // Característica TX (para enviar notificaciones al teléfono)
+  pCharTX = pService->createCharacteristic(
+    CHAR_UUID_TX,
+    NIMBLE_PROPERTY::NOTIFY | NIMBLE_PROPERTY::READ
+  );
+
+  // Característica RX (para recibir datos del teléfono)
+  pCharRX = pService->createCharacteristic(
+    CHAR_UUID_RX,
+    NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR
+  );
+  pCharRX->setCallbacks(callbacks);
+
+  pService->start();
+
+  NimBLEAdvertising* pAdv = NimBLEDevice::getAdvertising();
+  pAdv->addServiceUUID(SERVICE_UUID);
+  pAdv->setName(DEVICE_NAME);
+  pAdv->start();
+
+  Serial.println("BLE iniciado con 2 caracteristicas (TX/RX)");
+  Serial.printf("Service: %s\n", SERVICE_UUID);
+  Serial.printf("RX (write): %s\n", CHAR_UUID_RX);
+}
+
+// ==================== SETUP ====================
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println("\n=== SIDEBIKE v2.1 ===");
+
+  pinMode(TOUCH_PIN, INPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  Wire.begin(SDA_PIN, SCL_PIN);
+  display.begin();
+
+  display.clearBuffer();
+  display.setFont(u8g2_font_ncenB14_tr);
+  display.drawStr(20, 35, "SIDEBIKE");
+  display.setFont(u8g2_font_ncenB08_tr);
+  display.drawStr(45, 55, "v2.1");
+  display.sendBuffer();
+
+  playStartupMelody();  // Melodía tipo Mario Bros
+  delay(500);
+
+  setupBLE();
+
+  // Lectura inicial de batería
+  batteryLevel = readBatteryLevel();
+  Serial.printf("Batería: %d%%\n", batteryLevel);
+
+  startTime = millis();
+  currentState = STATE_PAIRING;
+  Serial.println("Setup OK");
+}
+
+// ==================== LOOP ====================
+void loop() {
+  // Leer batería cada 30 segundos
+  if (millis() - lastBatteryRead >= 30000) {
+    lastBatteryRead = millis();
+    batteryLevel = readBatteryLevel();
+  }
+
+  // Timeout de pairing (solo afecta al mensaje en pantalla)
+  if (pairingMode && (millis() - startTime > PAIRING_WINDOW_MS)) {
+    pairingMode = false;
+    currentState = STATE_CLOCK;
+    // NO detenemos advertising - siempre permitimos reconexión
+    Serial.println("Ventana de pairing cerrada, pero advertising continua");
+  }
+  
+  // Timeout de notificación - volver al estado anterior después de 5 segundos
+  if (currentState == STATE_NOTIFICATION && (millis() - notifStartTime > 5000)) {
+    notifActive = false;
+    // Volver al estado anterior (NAV si estaba activo, sino reloj)
+    if (stateBeforeNotif == STATE_NAVIGATION && navActive) {
+      currentState = STATE_NAVIGATION;
+    } else {
+      currentState = STATE_CLOCK;
+    }
+    Serial.println(">>> Timeout notificación, volviendo a estado anterior");
+  }
+  
+  // Si no estamos conectados, asegurarnos de que advertising está activo
+  if (!deviceConnected && !NimBLEDevice::getAdvertising()->isAdvertising()) {
+    NimBLEDevice::startAdvertising();
+    Serial.println("Reiniciando advertising...");
+  }
+
+  // Procesar datos recibidos (del callback)
+  if (newData) {
+    newData = false;
+    Serial.println(">>> Datos del callback");
+    processMessage(receivedData);
+    receivedData = "";
+  }
+
+  // Polling de la característica RX (backup)
+  if (deviceConnected && pCharRX != nullptr) {
+    static String lastRxValue = "";
+    NimBLEAttValue val = pCharRX->getValue();
+    if (val.length() > 0) {
+      String currentVal = String((char*)val.data(), val.length());
+      if (currentVal != lastRxValue && currentVal.length() > 0) {
+        Serial.println(">>> Datos por polling RX:");
+        Serial.println("    [" + currentVal + "]");
+        processMessage(currentVal);
+        lastRxValue = currentVal;
+      }
+    }
+  }
+
+  // Touch con detección de toque prolongado
+  static bool lastTouch = false;
+  static unsigned long touchStartTime = 0;
+  static bool longPressHandled = false;
+  const unsigned long LONG_PRESS_MS = 1500;  // 1.5 segundos para toque prolongado
+  
+  bool touch = digitalRead(TOUCH_PIN);
+  
+  if (touch && !lastTouch) {
+    // Inicio del toque
+    touchStartTime = millis();
+    longPressHandled = false;
+  }
+  else if (touch && lastTouch) {
+    // Toque mantenido - verificar si es prolongado
+    if (!longPressHandled && (millis() - touchStartTime >= LONG_PRESS_MS)) {
+      longPressHandled = true;
+      
+      // Toque prolongado: activar emparejamiento si no está conectado
+      if (!deviceConnected) {
+        Serial.println(">>> TOQUE PROLONGADO - Activando modo emparejamiento");
+        pairingMode = true;
+        currentState = STATE_PAIRING;
+        startTime = millis();  // Reiniciar contador de emparejamiento
+        NimBLEDevice::startAdvertising();
+        beep(200);  // Beep largo para confirmar
+      } else {
+        Serial.println(">>> TOQUE PROLONGADO - Ya conectado, ignorando");
+        beep(50);
+      }
+    }
+  }
+  else if (!touch && lastTouch) {
+    // Fin del toque - si fue corto, procesar como tap normal
+    if (!longPressHandled && (millis() - touchStartTime < LONG_PRESS_MS)) {
+      beep(30);
+        if (currentState == STATE_PAIRING) {
+          pairingMode = false;
+          if (!deviceConnected) NimBLEDevice::stopAdvertising();
+          currentState = STATE_CLOCK;
+        } else if (currentState == STATE_NOTIFICATION) {
+          // Descartar notificación con toque
+          notifActive = false;
+          currentState = STATE_CLOCK;
+        } else if (notifActive && currentState == STATE_CLOCK) {
+          // Volver a ver la notificación
+          currentState = STATE_NOTIFICATION;
+        } else if (navActive && currentState == STATE_CLOCK) {
+        currentState = STATE_NAVIGATION;
+      } else if (currentState == STATE_NAVIGATION) {
+        currentState = STATE_CLOCK;
+      }
+    }
+  }
+  lastTouch = touch;
+
+  // Display
+  switch (currentState) {
+    case STATE_PAIRING: showPairing(); break;
+    case STATE_NAVIGATION: showNavigation(); break;
+    case STATE_NOTIFICATION: showNotification(); break;
+    default: showClock(); break;
+  }
+
+  delay(50);
+}
