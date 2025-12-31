@@ -158,8 +158,6 @@ void playStartupMelody() {
   noTone(BUZZER_PIN);
 }
 
-
-
 // ==================== PROCESAMIENTO ====================
 void processMessage(String msg) {
   msg.trim();
@@ -186,8 +184,8 @@ void processMessage(String msg) {
       navETA = (p4 > p3) ? msg.substring(p4 + 1) : "";
       
       // Si algún valor contiene % (variable Tasker no resuelta), mostrar "-"
-      if (navDistance.indexOf('%') >= 0) navDistance = "-";
-      if (navStreet.indexOf('%') >= 0) navStreet = "-";
+      if (navDistance.indexOf('%') >= 0) navDistance = "";
+      if (navStreet.indexOf('%') >= 0) navStreet = "";
       if (navETA.indexOf('%') >= 0) navETA = "";
     }
     navActive = true;
@@ -282,8 +280,8 @@ void showClock() {
   if (!timeSet) {
     display.setFont(u8g2_font_ncenB14_te);
     display.drawStr(10, 35, "Sin hora");
-    display.setFont(u8g2_font_ncenB08_te);
-    display.drawStr(5, 55, "Envia TIME desde Tasker");
+    //display.setFont(u8g2_font_ncenB08_te);
+    //display.drawStr(5, 55, "Envia hora");
   } else {
     static unsigned long lastUpdate = 0;
     if (millis() - lastUpdate >= 1000) {
@@ -348,12 +346,28 @@ void showNavigation() {
     // Flecha "rotonda con salida izquierda"
     display.drawXBMP(arrowX, arrowY, NAV_ARROW_W, NAV_ARROW_H, nav_arrow_round_left);
   }
+  else if (navIcon == "356e3bf9bdb7f69a77e845464f489aba") {
+    // Flecha "rotonda con salida arriba-izquierda"
+    display.drawXBMP(arrowX, arrowY, NAV_ARROW_W, NAV_ARROW_H, nav_arrow_round_up_left);
+  }
+  else if (navIcon == "a294573bb87f9b91ac109ca1feb60253") {
+    // Flecha "rotonda con salida arriba-derecha"
+    display.drawXBMP(arrowX, arrowY, NAV_ARROW_W, NAV_ARROW_H, nav_arrow_round_up_right);
+  }
+  else if (navIcon == "04ccb66fe89793824169db323392aeae") {
+    // Flecha "recto con dos carriles"
+    display.drawXBMP(arrowX, arrowY, NAV_ARROW_W, NAV_ARROW_H, nav_arrow_ahead_2);
+  }
+  else if (navIcon == "9dd54fb607c8a7b11c4cf98adf8d5d4d") {
+    // Flecha "giro a leve derecha 2"
+    display.drawXBMP(arrowX, arrowY, NAV_ARROW_W, NAV_ARROW_H, nav_arrow_right_light_2);
+  }
   else {
     // Flecha por defecto para MD5 no reconocidos
     display.drawXBMP(arrowX, arrowY, NAV_ARROW_W, NAV_ARROW_H, nav_arrow_ahead);
   }
 
-  // Nombre de calle a la derecha (convertir UTF-8 a Latin-1)
+  // Nombre de calle a la derecha
   display.setFont(u8g2_font_ncenB10_te);
   int maxWidth = 90;
   int xText = 36;
@@ -569,8 +583,6 @@ void setup() {
   delay(500);
 
   setupBLE();
-
-
 
   startTime = millis();
   currentState = STATE_PAIRING;
