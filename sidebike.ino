@@ -5,6 +5,8 @@
  * Compatible con Tasker + BLE Tasker Plugin
  */
 
+#define VERSION "v2.1"
+
 #include <Wire.h>
 #include <U8g2lib.h>
 #include <NimBLEDevice.h>
@@ -197,20 +199,42 @@ void processMessage(String msg) {
     int p2 = msg.indexOf('|', p1 + 1);
     
     if (p1 > 0 && p2 > p1) {
-      // Formato esperado: TIME|DD/MM/YYYY|HH:MM:SS
+      // Formato flexible: TIME|D-M-YY|HH.MM o TIME|DD/MM/YYYY|HH:MM:SS
       String dateStr = msg.substring(p1 + 1, p2);
       String timeStr = msg.substring(p2 + 1);
       
-      timeInfo.tm_mday = dateStr.substring(0, 2).toInt();
-      timeInfo.tm_mon = dateStr.substring(3, 5).toInt() - 1;
+      // Reemplazar separadores alternativos para normalizar
+      dateStr.replace("-", "/");
+      timeStr.replace(".", ":");
       
-      // Soportar año corto (YY) o largo (YYYY)
-      int year = dateStr.substring(6).toInt();
-      if (year < 100) year += 2000;  // 25 -> 2025
-      timeInfo.tm_year = year - 1900;
-      timeInfo.tm_hour = timeStr.substring(0, 2).toInt();
-      timeInfo.tm_min = timeStr.substring(3, 5).toInt();
-      timeInfo.tm_sec = timeStr.substring(6, 8).toInt();
+      // Parsear fecha con separador /
+      int ds1 = dateStr.indexOf('/');
+      int ds2 = dateStr.indexOf('/', ds1 + 1);
+      
+      if (ds1 > 0 && ds2 > ds1) {
+        timeInfo.tm_mday = dateStr.substring(0, ds1).toInt();
+        timeInfo.tm_mon = dateStr.substring(ds1 + 1, ds2).toInt() - 1;
+        
+        // Soportar año corto (YY) o largo (YYYY)
+        int year = dateStr.substring(ds2 + 1).toInt();
+        if (year < 100) year += 2000;  // 26 -> 2026
+        timeInfo.tm_year = year - 1900;
+      }
+      
+      // Parsear hora con separador :
+      int ts1 = timeStr.indexOf(':');
+      int ts2 = (ts1 > 0) ? timeStr.indexOf(':', ts1 + 1) : -1;
+      
+      if (ts1 > 0) {
+        timeInfo.tm_hour = timeStr.substring(0, ts1).toInt();
+        if (ts2 > ts1) {
+          timeInfo.tm_min = timeStr.substring(ts1 + 1, ts2).toInt();
+          timeInfo.tm_sec = timeStr.substring(ts2 + 1).toInt();
+        } else {
+          timeInfo.tm_min = timeStr.substring(ts1 + 1).toInt();
+          timeInfo.tm_sec = 0;
+        }
+      }
 
       mktime(&timeInfo);
       timeSet = true;
@@ -334,6 +358,10 @@ void showNavigation() {
     // Flecha "girar derecha"
     display.drawXBMP(arrowX, arrowY, NAV_ARROW_W, NAV_ARROW_H, nav_arrow_right);
   }
+  else if (navIcon == "f467a04ac3ffa41cbce03096b28bd44b") {
+    // Flecha "girar leve izquierda"
+    display.drawXBMP(arrowX, arrowY, NAV_ARROW_W, NAV_ARROW_H, nav_arrow_left_light);
+  }
   else if (navIcon == "0ad898f6410fe51971fe1b7159994f26") {
     // Flecha "girar izquierda"
     display.drawXBMP(arrowX, arrowY, NAV_ARROW_W, NAV_ARROW_H, nav_arrow_left);
@@ -362,9 +390,22 @@ void showNavigation() {
     // Flecha "giro a leve derecha 2"
     display.drawXBMP(arrowX, arrowY, NAV_ARROW_W, NAV_ARROW_H, nav_arrow_right_light_2);
   }
+  else if (navIcon == "4373638104f4cc57e201b63157aedacc") {
+    // Flecha "giro a leve izquierda 2"
+    display.drawXBMP(arrowX, arrowY, NAV_ARROW_W, NAV_ARROW_H, nav_arrow_left_light_2);
+  }
+  else if (navIcon == "c61a34040606ee47fda0f67864f6dcf0") {
+    // Flecha "Rotonda cambio de sentido"
+    display.drawXBMP(arrowX, arrowY, NAV_ARROW_W, NAV_ARROW_H, nav_arrow_round);
+  }
+  else if (navIcon == "19ff9ca1c8a743205da0e893c65bcbbe") {
+    // Flecha "Giro brusco derecha"
+    display.drawXBMP(arrowX, arrowY, NAV_ARROW_W, NAV_ARROW_H, nav_arrow_right_hard);
+  }
   else {
-    // Flecha por defecto para MD5 no reconocidos
-    display.drawXBMP(arrowX, arrowY, NAV_ARROW_W, NAV_ARROW_H, nav_arrow_ahead);
+    // MD5 no reconocido - mostrar "-" para identificarlo
+    display.setFont(u8g2_font_ncenB24_tr);
+    display.drawStr(arrowX + 8, arrowY + 36, "-");
   }
 
   // Nombre de calle a la derecha
@@ -563,7 +604,7 @@ void setupBLE() {
 void setup() {
   Serial.begin(115200);
   delay(1000);
-  Serial.println("\n=== SIDEBIKE v2.1 ===");
+  Serial.println("\n=== SIDEBIKE " VERSION " ===");
 
   pinMode(TOUCH_PIN, INPUT);
   pinMode(BUZZER_PIN, OUTPUT);
@@ -572,13 +613,45 @@ void setup() {
   Wire.begin(SDA_PIN, SCL_PIN);
   display.begin();
 
+  // ==================== ANIMACIÓN DE INICIO ====================
+  // Dimensiones del icono del casco: 60x60px
+  const int HELMET_W = 60;
+  const int HELMET_H = 60;
+  
+  // Posición inicial: centrado en pantalla (128x64)
+  int helmetX = (128 - HELMET_W) / 2;  // 34
+  int helmetY = (64 - HELMET_H) / 2;   // 2
+  
+  // 1. Mostrar casco centrado
   display.clearBuffer();
-  display.setFont(u8g2_font_ncenB14_tr);
-  display.drawStr(20, 35, "SIDEBIKE");
-  display.setFont(u8g2_font_ncenB08_tr);
-  display.drawStr(45, 55, "v2.1");
+  display.drawXBMP(helmetX, helmetY, HELMET_W, HELMET_H, epd_bitmap_icono_casco);
   display.sendBuffer();
-
+  delay(800);  // Pausa para ver el casco centrado
+  
+  // 2. Animar casco hacia la izquierda
+  int targetX = 2;  // Posición final del casco a la izquierda
+  for (int x = helmetX; x >= targetX; x -= 4) {
+    display.clearBuffer();
+    display.drawXBMP(x, helmetY, HELMET_W, HELMET_H, epd_bitmap_icono_casco);
+    display.sendBuffer();
+    delay(20);  // Velocidad de la animación
+  }
+  
+  // 3. Mostrar texto SIDEBIKE y versión a la derecha
+  display.clearBuffer();
+  display.drawXBMP(targetX, helmetY, HELMET_W, HELMET_H, epd_bitmap_icono_casco);
+  
+  // Texto "SIDEBIKE" a la derecha del casco
+  display.setFont(u8g2_font_ncenB08_tr);
+  int textX = targetX + HELMET_W + 4;  // 66
+  display.drawStr(textX, 30, "SIDEBIKE");
+  
+  // Versión debajo de SIDEBIKE
+  display.setFont(u8g2_font_ncenB08_tr);
+  display.drawStr(textX + 10, 48, VERSION);
+  
+  display.sendBuffer();
+  
   playStartupMelody();  // Melodía tipo Mario Bros
   delay(500);
 
