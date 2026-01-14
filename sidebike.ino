@@ -46,6 +46,7 @@ unsigned long startTime = 0;
 // Buffer para datos recibidos
 volatile bool newData = false;
 String receivedData = "";
+String lastProcessedMsg = "";  // Evitar duplicados callback/polling
 
 // Navegación
 String navIcon = "";
@@ -66,6 +67,7 @@ DeviceState stateBeforeNotif = STATE_CLOCK;  // Estado al que volver después de
 // Tiempo
 struct tm timeInfo;
 bool timeSet = false;
+unsigned long lastTimeUpdate = 0;  // Para actualizar el tiempo en segundo plano
 const char* diasSemana[] = {"dom", "lun", "mar", "mie", "jue", "vie", "sab"};
 
 
@@ -127,12 +129,10 @@ public:
   }
 
   void onWrite(NimBLECharacteristic* pChar, NimBLEConnInfo& connInfo) override {
-    Serial.println(">>> WRITE RECIBIDO!");
     NimBLEAttValue value = pChar->getValue();
     if (value.length() > 0) {
       receivedData = String((char*)value.data(), value.length());
       newData = true;
-      Serial.println("    Datos: [" + receivedData + "]");
     }
   }
 };
@@ -168,7 +168,11 @@ void processMessage(String msg) {
   if (msg.startsWith("[")) msg = msg.substring(1);
   if (msg.endsWith("]")) msg = msg.substring(0, msg.length() - 1);
   
-  Serial.println("Procesando: [" + msg + "]");
+  Serial.println("RX: " + msg);
+  
+  // Evitar procesar el mismo mensaje dos veces
+  if (msg == lastProcessedMsg) return;
+  lastProcessedMsg = msg;
 
   int p = msg.indexOf('|');
   String cmd = (p > 0) ? msg.substring(0, p) : msg;
@@ -199,33 +203,28 @@ void processMessage(String msg) {
     int p2 = msg.indexOf('|', p1 + 1);
     
     if (p1 > 0 && p2 > p1) {
-      // Formato flexible: TIME|D-M-YY|HH.MM o TIME|DD/MM/YYYY|HH:MM:SS
       String dateStr = msg.substring(p1 + 1, p2);
       String timeStr = msg.substring(p2 + 1);
       
-      // Reemplazar separadores alternativos para normalizar
       dateStr.replace("-", "/");
       timeStr.replace(".", ":");
       
-      // Parsear fecha con separador /
       int ds1 = dateStr.indexOf('/');
       int ds2 = dateStr.indexOf('/', ds1 + 1);
       
       if (ds1 > 0 && ds2 > ds1) {
         timeInfo.tm_mday = dateStr.substring(0, ds1).toInt();
         timeInfo.tm_mon = dateStr.substring(ds1 + 1, ds2).toInt() - 1;
-        
-        // Soportar año corto (YY) o largo (YYYY)
         int year = dateStr.substring(ds2 + 1).toInt();
-        if (year < 100) year += 2000;  // 26 -> 2026
+        if (year < 100) year += 2000;
         timeInfo.tm_year = year - 1900;
       }
       
-      // Parsear hora con separador :
       int ts1 = timeStr.indexOf(':');
       int ts2 = (ts1 > 0) ? timeStr.indexOf(':', ts1 + 1) : -1;
       
       if (ts1 > 0) {
+        // Formato HH:MM o HH:MM:SS
         timeInfo.tm_hour = timeStr.substring(0, ts1).toInt();
         if (ts2 > ts1) {
           timeInfo.tm_min = timeStr.substring(ts1 + 1, ts2).toInt();
@@ -234,15 +233,21 @@ void processMessage(String msg) {
           timeInfo.tm_min = timeStr.substring(ts1 + 1).toInt();
           timeInfo.tm_sec = 0;
         }
+      } else if (timeStr.length() > 6) {
+        // Formato timestamp Unix (segundos desde epoch)
+        time_t epoch = (time_t)timeStr.toInt();
+        struct tm* parsed = localtime(&epoch);
+        if (parsed) {
+          timeInfo = *parsed;
+        }
       }
 
       mktime(&timeInfo);
+      lastTimeUpdate = millis();  // Sincronizar el contador
       timeSet = true;
-      Serial.println(">>> HORA ESTABLECIDA!");
-      Serial.printf("    Fecha: %02d/%02d/%04d\n", timeInfo.tm_mday, timeInfo.tm_mon + 1, timeInfo.tm_year + 1900);
-      Serial.printf("    Hora: %02d:%02d:%02d\n", timeInfo.tm_hour, timeInfo.tm_min, timeInfo.tm_sec);
-    } else {
-      Serial.println("ERROR: Formato TIME invalido");
+      Serial.printf("TIME: %02d:%02d:%02d %02d/%02d/%04d\n", 
+        timeInfo.tm_hour, timeInfo.tm_min, timeInfo.tm_sec,
+        timeInfo.tm_mday, timeInfo.tm_mon + 1, timeInfo.tm_year + 1900);
     }
   }
   else if (cmd == "NOTIF") {
@@ -275,24 +280,19 @@ void processMessage(String msg) {
       beep(100);
       delay(50);
       beep(100);  // Doble beep para notificación
-      Serial.println(">>> NOTIFICACION RECIBIDA");
-      Serial.printf("    App: %s\n", notifApp.c_str());
-      Serial.printf("    De: %s\n", notifSender.c_str());
-      Serial.printf("    Msg: %s\n", notifMessage.c_str());
+      Serial.printf("NOTIF: %s - %s\n", notifApp.c_str(), notifSender.c_str());
     }
   }
   else if (cmd == "END") {
-    Serial.println("cmd2: " + cmd);
     navActive = false;
     notifActive = false;
     currentState = STATE_CLOCK;
     beep(100);
+    Serial.println("NAV: Fin");
   }
   else if (cmd == "DISMISS") {
-    // Descartar notificación actual
     notifActive = false;
     currentState = STATE_CLOCK;
-    Serial.println(">>> NOTIFICACION DESCARTADA");
   }
 }
 
@@ -300,20 +300,11 @@ void processMessage(String msg) {
 void showClock() {
   display.clearBuffer();
 
-
   if (!timeSet) {
     display.setFont(u8g2_font_ncenB14_te);
     display.drawStr(10, 35, "Sin hora");
-    //display.setFont(u8g2_font_ncenB08_te);
-    //display.drawStr(5, 55, "Envia hora");
   } else {
-    static unsigned long lastUpdate = 0;
-    if (millis() - lastUpdate >= 1000) {
-      lastUpdate = millis();
-      timeInfo.tm_sec++;
-      mktime(&timeInfo);
-    }
-
+    // El tiempo ya se actualiza en el loop(), aquí solo mostramos
     char buf[10];
     sprintf(buf, "%02d:%02d", timeInfo.tm_hour, timeInfo.tm_min);
     display.setFont(u8g2_font_logisoso32_tn);
@@ -612,6 +603,10 @@ void setup() {
 
   Wire.begin(SDA_PIN, SCL_PIN);
   display.begin();
+  
+  // Configurar zona horaria España (CET/CEST con cambio automático)
+  setenv("TZ", "CET-1CEST,M3.5.0,M10.5.0/3", 1);
+  tzset();
 
   // ==================== ANIMACIÓN DE INICIO ====================
   // Dimensiones del icono del casco: 60x60px
@@ -664,6 +659,12 @@ void setup() {
 
 // ==================== LOOP ====================
 void loop() {
+  // Actualizar tiempo en segundo plano (siempre, independiente de la pantalla)
+  if (timeSet && (millis() - lastTimeUpdate >= 1000)) {
+    lastTimeUpdate = millis();
+    timeInfo.tm_sec++;
+    mktime(&timeInfo);  // Normaliza y ajusta día/hora si es necesario
+  }
 
 
   // Timeout de pairing (solo afecta al mensaje en pantalla)
@@ -695,21 +696,18 @@ void loop() {
   // Procesar datos recibidos (del callback)
   if (newData) {
     newData = false;
-    Serial.println(">>> Datos del callback");
     processMessage(receivedData);
     receivedData = "";
   }
 
-  // Polling de la característica RX (backup)
+  // Polling de la característica RX (backup - solo si no hubo callback)
   if (deviceConnected && pCharRX != nullptr) {
     static String lastRxValue = "";
     NimBLEAttValue val = pCharRX->getValue();
     if (val.length() > 0) {
       String currentVal = String((char*)val.data(), val.length());
       if (currentVal != lastRxValue && currentVal.length() > 0) {
-        Serial.println(">>> Datos por polling RX:");
-        Serial.println("    [" + currentVal + "]");
-        processMessage(currentVal);
+        processMessage(currentVal);  // El check de duplicados está en processMessage
         lastRxValue = currentVal;
       }
     }
