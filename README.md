@@ -1,4 +1,4 @@
-# SIDEBIKE - ESP32-C3 Navigation Display v2.1
+# SIDEBIKE - ESP32-C3 Navigation Display v2.2
 
 Dispositivo wearable que muestra hora/fecha, recibe indicaciones de navegación de Google Maps y notificaciones de apps (WhatsApp, Telegram, etc.) vía Bluetooth BLE desde Tasker.
 
@@ -112,10 +112,12 @@ Task:
 | Comando | Formato | Descripción |
 |---------|---------|-------------|
 | NAV | `NAV\|md5_icono\|distancia\|calle\|eta` | Indicación de navegación |
-| TIME | `TIME\|DD/MM/YYYY\|HH:MM:SS` | Sincronizar hora |
+| TIME | `TIME\|DD-MM-YY\|HH.MM.SS` o `TIME\|DD-MM-YY\|timestamp` | Sincronizar hora |
 | NOTIF | `NOTIF\|app\|remitente\|mensaje\|hora` | Notificación de app |
 | END | `END` | Fin de navegación |
 | DISMISS | `DISMISS` | Descartar notificación actual |
+
+> 💡 **Nota**: El campo TIME acepta tanto formato `HH:MM:SS` como timestamp Unix (`%TIMES` de Tasker). La zona horaria está configurada para España (CET/CEST).
 
 ### Iconos de navegación por MD5
 
@@ -123,14 +125,22 @@ El dispositivo identifica las flechas de navegación mediante el hash MD5 del ic
 
 | MD5 Hash | Flecha |
 |----------|--------|
-| `13e68aacc62531a385e2b3e9705e0701` | Continuar recto (cuerpo discontinuo) |
+| `13e68aacc62531a385e2b3e9705e0701` | Continuar recto (discontinuo) |
 | `3cc9cfaca8339431dfa25b4d26337d38` | Recto continuo |
 | `1608d2493a2650b2aa05f0f11588d8be` | Girar derecha |
 | `0ad898f6410fe51971fe1b7159994f26` | Girar izquierda |
+| `f467a04ac3ffa41cbce03096b28bd44b` | Girar leve izquierda |
 | `5710fb9ddabf6d18b95e424783ca8fae` | Girar leve derecha |
+| `9dd54fb607c8a7b11c4cf98adf8d5d4d` | Girar leve derecha (alt) |
+| `4373638104f4cc57e201b63157aedacc` | Girar leve izquierda (alt) |
+| `19ff9ca1c8a743205da0e893c65bcbbe` | Giro brusco derecha |
 | `627c26a2d87e696a2b73d624145235a8` | Rotonda salida izquierda |
+| `356e3bf9bdb7f69a77e845464f489aba` | Rotonda arriba-izquierda |
+| `a294573bb87f9b91ac109ca1feb60253` | Rotonda arriba-derecha |
+| `c61a34040606ee47fda0f67864f6dcf0` | Rotonda cambio sentido |
+| `04ccb66fe89793824169db323392aeae` | Recto dos carriles |
 
-Para otros MD5 no reconocidos, se muestra la flecha de "continuar recto" por defecto.
+Para MD5 no reconocidos, se muestra "-" para identificarlo.
 
 ### Ejemplos de notificaciones
 ```
@@ -187,11 +197,16 @@ sidebike/
 
 ## 📝 Changelog
 
+### v2.2
+- Reloj funciona en segundo plano (hora correcta al volver de navegación)
+- Soporte para timestamp Unix en TIME (`%TIMES` de Tasker)
+- Zona horaria España (CET/CEST) configurada automáticamente
+- Logs optimizados y sin duplicados
+- Soporte para 14 tipos de flechas de navegación
+
 ### v2.1
 - Sistema de navegación basado en MD5 para identificar flechas
-- Soporte para 6 tipos de flechas de navegación
 - Campo ETA (tiempo estimado de llegada)
-
 - Notificaciones con timeout automático (5s)
 - Toque prolongado para reactivar emparejamiento
 - Melodía de inicio estilo Mario Bros

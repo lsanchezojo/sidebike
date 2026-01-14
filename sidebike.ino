@@ -5,7 +5,7 @@
  * Compatible con Tasker + BLE Tasker Plugin
  */
 
-#define VERSION "v2.1"
+#define VERSION "v2.2"
 
 #include <Wire.h>
 #include <U8g2lib.h>
