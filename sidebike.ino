@@ -11,6 +11,8 @@
 #include <U8g2lib.h>
 #include <NimBLEDevice.h>
 #include <time.h>
+#include <FS.h>
+#include <SPIFFS.h>
 #include "images.h"
 
 // ==================== PINES ====================
@@ -70,11 +72,18 @@ bool timeSet = false;
 unsigned long lastTimeUpdate = 0;  // Para actualizar el tiempo en segundo plano
 const char* diasSemana[] = {"dom", "lun", "mar", "mie", "jue", "vie", "sab"};
 
+// Log NAV (SPIFFS)
+const char* NAV_LOG_PATH = "/nav_log.txt";
+const size_t NAV_LOG_MAX_BYTES = 16384;
+bool spiffsReady = false;
+
 
 
 // ==================== FORWARD DECLARATIONS ====================
 void beep(int ms);
 void processMessage(String msg);
+void logNavNotification(const String& rawMsg, bool parsed, const String& icon, const String& distance, const String& street, const String& eta);
+void handleSerialCommands();
 
 
 
@@ -103,6 +112,122 @@ String utf8ToLatin1(String utf8) {
     }
   }
   return result;
+}
+
+String sanitizeLogValue(String value) {
+  value.replace('\r', ' ');
+  value.replace('\n', ' ');
+  value.replace('|', '/');
+  return value;
+}
+
+String getTimestamp() {
+  char buf[24];
+  if (timeSet) {
+    snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d",
+             timeInfo.tm_year + 1900, timeInfo.tm_mon + 1, timeInfo.tm_mday,
+             timeInfo.tm_hour, timeInfo.tm_min, timeInfo.tm_sec);
+  } else {
+    snprintf(buf, sizeof(buf), "ms:%lu", millis());
+  }
+  return String(buf);
+}
+
+void logNavNotification(const String& rawMsg, bool parsed, const String& icon, const String& distance, const String& street, const String& eta) {
+  if (!spiffsReady) return;
+
+  String line = getTimestamp();
+  line += "|NAV";
+  line += "|parsed=" + String(parsed ? "1" : "0");
+  line += "|icon=" + sanitizeLogValue(icon);
+  line += "|dist=" + sanitizeLogValue(distance);
+  line += "|street=" + sanitizeLogValue(street);
+  line += "|eta=" + sanitizeLogValue(eta);
+  line += "|raw=" + sanitizeLogValue(rawMsg);
+  line += "\n";
+
+  size_t currentSize = 0;
+  if (SPIFFS.exists(NAV_LOG_PATH)) {
+    File readFile = SPIFFS.open(NAV_LOG_PATH, FILE_READ);
+    if (readFile) {
+      currentSize = readFile.size();
+      readFile.close();
+    }
+  }
+
+  if (currentSize + line.length() > NAV_LOG_MAX_BYTES) {
+    SPIFFS.remove(NAV_LOG_PATH);
+    File rotateFile = SPIFFS.open(NAV_LOG_PATH, FILE_WRITE);
+    if (rotateFile) {
+      rotateFile.println("LOG ROTATED");
+      rotateFile.close();
+    }
+  }
+
+  File file = SPIFFS.open(NAV_LOG_PATH, FILE_APPEND);
+  if (file) {
+    file.print(line);
+    file.close();
+  }
+}
+
+void dumpNavLog() {
+  if (!spiffsReady) {
+    Serial.println("LOG: SPIFFS no listo");
+    return;
+  }
+  if (!SPIFFS.exists(NAV_LOG_PATH)) {
+    Serial.println("LOG: vacio");
+    return;
+  }
+  File file = SPIFFS.open(NAV_LOG_PATH, FILE_READ);
+  if (!file) {
+    Serial.println("LOG: error al abrir");
+    return;
+  }
+  Serial.println("--- NAV LOG START ---");
+  while (file.available()) {
+    Serial.write(file.read());
+  }
+  Serial.println("--- NAV LOG END ---");
+  file.close();
+}
+
+void clearNavLog() {
+  if (!spiffsReady) {
+    Serial.println("LOG: SPIFFS no listo");
+    return;
+  }
+  if (SPIFFS.exists(NAV_LOG_PATH)) {
+    SPIFFS.remove(NAV_LOG_PATH);
+  }
+  Serial.println("LOG: borrado");
+}
+
+void handleSerialCommands() {
+  if (!Serial.available()) return;
+  String cmd = Serial.readStringUntil('\n');
+  cmd.trim();
+
+  if (cmd.equalsIgnoreCase("LOG")) {
+    dumpNavLog();
+  } else if (cmd.equalsIgnoreCase("LOGCLEAR")) {
+    clearNavLog();
+  } else if (cmd.equalsIgnoreCase("LOGSIZE")) {
+    if (!spiffsReady) {
+      Serial.println("LOG: SPIFFS no listo");
+      return;
+    }
+    if (SPIFFS.exists(NAV_LOG_PATH)) {
+      File file = SPIFFS.open(NAV_LOG_PATH, FILE_READ);
+      if (file) {
+        Serial.printf("LOG: %u bytes\n", (unsigned int)file.size());
+        file.close();
+      }
+    } else {
+      Serial.println("LOG: 0 bytes");
+    }
+  }
 }
 
 // ==================== CALLBACKS ====================
@@ -183,16 +308,38 @@ void processMessage(String msg) {
     int p2 = msg.indexOf('|', p1 + 1);
     int p3 = msg.indexOf('|', p2 + 1);
     int p4 = msg.indexOf('|', p3 + 1);
+    String icon = "";
+    String distance = "";
+    String street = "";
+    String eta = "";
+    bool parsed = false;
+    bool distanceValid = false;
     if (p1 > 0 && p2 > p1) {
-      navIcon = msg.substring(p1 + 1, p2);
-      navDistance = (p3 > p2) ? msg.substring(p2 + 1, p3) : msg.substring(p2 + 1);
-      navStreet = (p3 > p2 && p4 > p3) ? msg.substring(p3 + 1, p4) : (p3 > p2) ? msg.substring(p3 + 1) : "";
-      navETA = (p4 > p3) ? msg.substring(p4 + 1) : "";
+      icon = msg.substring(p1 + 1, p2);
+      distance = (p3 > p2) ? msg.substring(p2 + 1, p3) : msg.substring(p2 + 1);
+      street = (p3 > p2 && p4 > p3) ? msg.substring(p3 + 1, p4) : (p3 > p2) ? msg.substring(p3 + 1) : "";
+      eta = (p4 > p3) ? msg.substring(p4 + 1) : "";
+      parsed = true;
       
       // Si algún valor contiene % (variable Tasker no resuelta), mostrar "-"
-      if (navDistance.indexOf('%') >= 0) navDistance = "";
-      if (navStreet.indexOf('%') >= 0) navStreet = "";
-      if (navETA.indexOf('%') >= 0) navETA = "";
+      if (distance.indexOf('%') >= 0) distance = "";
+      if (street.indexOf('%') >= 0) street = "";
+      if (eta.indexOf('%') >= 0) eta = "";
+      if (icon.indexOf('%') >= 0) icon = "";
+      distanceValid = distance.length() > 0;
+    }
+
+    logNavNotification(msg, parsed, icon, distance, street, eta);
+
+    if (parsed) {
+      if (icon.length() > 0) {
+        navIcon = icon;
+      }
+      if (distanceValid) {
+        navDistance = distance;
+      }
+      navStreet = street;
+      navETA = eta;
     }
     navActive = true;
     currentState = STATE_NAVIGATION;
@@ -598,6 +745,7 @@ void setupBLE() {
 // ==================== SETUP ====================
 void setup() {
   Serial.begin(115200);
+  Serial.setTimeout(50);
   delay(1000);
   Serial.println("\n=== SIDEBIKE " VERSION " ===");
 
@@ -611,6 +759,13 @@ void setup() {
   // Configurar zona horaria España (CET/CEST con cambio automático)
   setenv("TZ", "CET-1CEST,M3.5.0,M10.5.0/3", 1);
   tzset();
+
+  spiffsReady = SPIFFS.begin(true);
+  if (spiffsReady) {
+    Serial.println("SPIFFS OK");
+  } else {
+    Serial.println("SPIFFS ERROR");
+  }
 
   // ==================== ANIMACIÓN DE INICIO ====================
   // Dimensiones del icono del casco: 60x60px
@@ -663,6 +818,7 @@ void setup() {
 
 // ==================== LOOP ====================
 void loop() {
+  handleSerialCommands();
   // Actualizar tiempo en segundo plano (siempre, independiente de la pantalla)
   if (timeSet && (millis() - lastTimeUpdate >= 1000)) {
     lastTimeUpdate = millis();
