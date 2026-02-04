@@ -524,6 +524,10 @@ void showNavigation() {
     // Flecha "rotonda con salida abajo-derecha"
     display.drawXBMP(arrowX, arrowY, NAV_ARROW_W, NAV_ARROW_H, nav_arrow_round_down_right);
   }
+  else if (navIcon == "aabc87341d29ca80ce62a5d35926bfa7") {
+    // Flecha "rotonda con salida abajo-izquierda"
+    display.drawXBMP(arrowX, arrowY, NAV_ARROW_W, NAV_ARROW_H, nav_arrow_round_down_left);
+  }
   else if (navIcon == "04ccb66fe89793824169db323392aeae") {
     // Flecha "recto con dos carriles"
     display.drawXBMP(arrowX, arrowY, NAV_ARROW_W, NAV_ARROW_H, nav_arrow_ahead_2);
