@@ -162,7 +162,40 @@ NOTIF|Instagram|maria_93|Te ha enviado un mensaje|
 7. **Touch corto**: Alterna entre reloj/navegación/notificación
 8. **Touch largo** (1.5s): Reactiva modo emparejamiento
 
+## 🖥️ Comandos Serial Monitor
 
+El dispositivo almacena un log de navegación en la memoria SPIFFS que puede ser consultado mediante comandos desde el Serial Monitor de Arduino IDE (115200 baudios).
+
+### Comandos disponibles
+
+| Comando | Descripción |
+|---------|-------------|
+| `LOG` | Muestra todo el contenido del log almacenado |
+| `LOGSIZE` | Muestra el tamaño del log en bytes |
+| `LOGCLEAR` | Borra completamente el log |
+
+### Formato del log
+
+El log almacena las notificaciones de navegación (NAV) con el siguiente formato:
+```
+TIMESTAMP|NAV|parsed=1|icon=MD5|dist=100m|street=Calle Principal|eta=10:30|raw=NAV|...
+```
+
+### Características del log
+- **Ubicación**: Almacenado en SPIFFS (`/nav_log.txt`)
+- **Tamaño máximo**: 16 KB (al alcanzar el límite, se rota automáticamente)
+- **Contenido**: Cada mensaje de navegación recibido con timestamp, datos parseados y mensaje original
+
+### Ejemplo de uso
+```
+1. Abre el Serial Monitor en Arduino IDE (115200 baudios)
+2. Escribe: LOG
+3. Presiona Enter
+4. Verás la salida:
+   --- NAV LOG START ---
+   2026-02-20 14:30:15|NAV|parsed=1|icon=13e68aac...|dist=500m|street=Gran Via|eta=14:45|raw=NAV|...
+   --- NAV LOG END ---
+```
 
 ## 🔧 Solución de Problemas
 

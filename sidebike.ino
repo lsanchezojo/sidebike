@@ -334,6 +334,9 @@ void processMessage(String msg) {
     if (parsed) {
       if (icon.length() > 0) {
         navIcon = icon;
+      } else if (eta.startsWith("0 min")) {
+        // Sin icono resuelto (%antitle vacío) y ETA = 0 min → icono de llegada
+        navIcon = "1608d2493a2650b2aa05f0f11588888";
       }
       if (distanceValid) {
         navDistance = distance;
@@ -547,6 +550,10 @@ void showNavigation() {
   else if (navIcon == "19ff9ca1c8a743205da0e893c65bcbbe") {
     // Flecha "Giro brusco derecha"
     display.drawXBMP(arrowX, arrowY, NAV_ARROW_W, NAV_ARROW_H, nav_arrow_right_hard);
+  }
+  else if (navIcon == "1608d2493a2650b2aa05f0f11588888") {
+    // Icono de llegada (ETA = 0 min, sin icono resuelto en %antitle)
+    display.drawXBMP(arrowX, arrowY, NAV_ARROW_W, NAV_ARROW_H, nav_arrow_arrival);
   }
   else {
     // MD5 no reconocido - mostrar "-" para identificarlo
