@@ -5,7 +5,7 @@
  * Compatible con Tasker + BLE Tasker Plugin
  */
 
-#define VERSION "v2.2"
+#define VERSION "v2.3"
 
 #include <Wire.h>
 #include <U8g2lib.h>
@@ -23,9 +23,9 @@
 
 // ==================== BLE UUIDs ====================
 #define DEVICE_NAME "SIDEBIKE"
-#define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
-#define CHAR_UUID_TX        "beb5483e-36e1-4688-b7f5-ea07361b26a8"  // Para enviar (NOTIFY)
-#define CHAR_UUID_RX        "beb5483e-36e1-4688-b7f5-ea07361b26a9"  // Para recibir (WRITE)
+#define SERVICE_UUID "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
+#define CHAR_UUID_TX "beb5483e-36e1-4688-b7f5-ea07361b26a8"  // Para enviar (NOTIFY)
+#define CHAR_UUID_RX "beb5483e-36e1-4688-b7f5-ea07361b26a9"  // Para recibir (WRITE)
 
 #define PAIRING_WINDOW_MS 120000
 
@@ -35,7 +35,10 @@
 U8G2_SH1106_128X64_NONAME_F_HW_I2C display(U8G2_R0, U8X8_PIN_NONE);
 
 // ==================== VARIABLES ====================
-enum DeviceState { STATE_CLOCK, STATE_NAVIGATION, STATE_PAIRING, STATE_NOTIFICATION };
+enum DeviceState { STATE_CLOCK,
+                   STATE_NAVIGATION,
+                   STATE_PAIRING,
+                   STATE_NOTIFICATION };
 DeviceState currentState = STATE_PAIRING;
 
 NimBLEServer* pServer = nullptr;
@@ -45,7 +48,8 @@ bool deviceConnected = false;
 bool pairingMode = true;
 unsigned long startTime = 0;
 
-// Buffer para datos recibidos
+// Buffer para datos recibidos (protegido con mutex)
+SemaphoreHandle_t rxMutex = nullptr;
 volatile bool newData = false;
 String receivedData = "";
 String lastProcessedMsg = "";  // Evitar duplicados callback/polling
@@ -58,30 +62,62 @@ String navETA = "";  // Tiempo restante al destino
 bool navActive = false;
 
 // Notificaciones de apps
-String notifApp = "";       // Nombre de la app (WhatsApp, Telegram, etc.)
-String notifSender = "";    // Remitente del mensaje
-String notifMessage = "";   // Contenido del mensaje
-String notifTime = "";      // Hora de la notificación
-bool notifActive = false;   // Hay notificación pendiente
-unsigned long notifStartTime = 0;  // Tiempo cuando se mostró la notificación
+String notifApp = "";                        // Nombre de la app (WhatsApp, Telegram, etc.)
+String notifSender = "";                     // Remitente del mensaje
+String notifMessage = "";                    // Contenido del mensaje
+String notifTime = "";                       // Hora de la notificación
+bool notifActive = false;                    // Hay notificación pendiente
+unsigned long notifStartTime = 0;            // Tiempo cuando se mostró la notificación
 DeviceState stateBeforeNotif = STATE_CLOCK;  // Estado al que volver después de notif
 
 // Tiempo
 struct tm timeInfo;
 bool timeSet = false;
 unsigned long lastTimeUpdate = 0;  // Para actualizar el tiempo en segundo plano
-const char* diasSemana[] = {"dom", "lun", "mar", "mie", "jue", "vie", "sab"};
+const char* diasSemana[] = { "dom", "lun", "mar", "mie", "jue", "vie", "sab" };
 
 // Log NAV (SPIFFS)
 const char* NAV_LOG_PATH = "/nav_log.txt";
 const size_t NAV_LOG_MAX_BYTES = 16384;
 bool spiffsReady = false;
 
+// Buzzer no bloqueante
+unsigned long beepEndTime = 0;
+bool beepActive = false;
+
+// ==================== TABLA DE ICONOS NAV ====================
+struct NavArrowEntry {
+  const char* md5;
+  const unsigned char* bitmap;
+};
+
+static const NavArrowEntry navArrowTable[] = {
+  { "13e68aacc62531a385e2b3e9705e0701", nav_arrow_ahead },
+  { "3cc9cfaca8339431dfa25b4d26337d38", nav_arrow_straight },
+  { "1608d2493a2650b2aa05f0f11588d8be", nav_arrow_right },
+  { "0ad898f6410fe51971fe1b7159994f26", nav_arrow_left },
+  { "f467a04ac3ffa41cbce03096b28bd44b", nav_arrow_left_light },
+  { "5710fb9ddabf6d18b95e424783ca8fae", nav_arrow_right_light },
+  { "627c26a2d87e696a2b73d624145235a8", nav_arrow_round_left },
+  { "356e3bf9bdb7f69a77e845464f489aba", nav_arrow_round_up_left },
+  { "a294573bb87f9b91ac109ca1feb60253", nav_arrow_round_up_right },
+  { "8e35ee07dd4429bedab970ddae62577c", nav_arrow_round_down_right },
+  { "aabc87341d29ca80ce62a5d35926bfa7", nav_arrow_round_down_left },
+  { "04ccb66fe89793824169db323392aeae", nav_arrow_ahead_2 },
+  { "9dd54fb607c8a7b11c4cf98adf8d5d4d", nav_arrow_right_light_2 },
+  { "4373638104f4cc57e201b63157aedacc", nav_arrow_left_light_2 },
+  { "c61a34040606ee47fda0f67864f6dcf0", nav_arrow_round },
+  { "19ff9ca1c8a743205da0e893c65bcbbe", nav_arrow_right_hard },
+  { "af29b4ff99a05f6b428d1f9174cb1153", nav_arrow_u_turn },
+  { "1608d2493a2650b2aa05f0f11588888", nav_arrow_arrival },
+};
+static const int NAV_ARROW_TABLE_SIZE = sizeof(navArrowTable) / sizeof(navArrowTable[0]);
 
 
 // ==================== FORWARD DECLARATIONS ====================
 void beep(int ms);
-void processMessage(String msg);
+void updateBeep();
+void processMessage(const String& msg);
 void logNavNotification(const String& rawMsg, bool parsed, const String& icon, const String& distance, const String& street, const String& eta);
 void handleSerialCommands();
 
@@ -90,31 +126,38 @@ void handleSerialCommands();
 
 // ==================== UTF-8 A LATIN-1 ====================
 // Convierte UTF-8 a ISO-8859-1 para que las fuentes _te muestren acentos
-String utf8ToLatin1(String utf8) {
+String utf8ToLatin1(const String& utf8) {
   String result = "";
-  for (int i = 0; i < utf8.length(); i++) {
+  for (int i = 0; i < (int)utf8.length(); i++) {
     uint8_t c = utf8.charAt(i);
     if (c < 0x80) {
       result += (char)c;
     } else if (c == 0xC2) {
       // Caracteres 0x80-0xBF (ej: °, ², etc.)
-      if (i + 1 < utf8.length()) {
+      if (i + 1 < (int)utf8.length()) {
         result += (char)utf8.charAt(++i);
       }
     } else if (c == 0xC3) {
       // Caracteres latinos acentuados (á=0xC3 0xA1 -> 0xE1)
-      if (i + 1 < utf8.length()) {
+      if (i + 1 < (int)utf8.length()) {
         result += (char)(utf8.charAt(++i) + 0x40);
       }
+    } else if (c >= 0xF0) {
+      // 4 bytes (emojis, etc.) - saltar 3 bytes extra
+      i += 3;
+    } else if (c >= 0xE0) {
+      // 3 bytes - saltar 2 bytes extra
+      i += 2;
     } else if (c >= 0xC4) {
-      // Otros caracteres multibyte - saltar
-      if (i + 1 < utf8.length()) i++;
+      // 2 bytes - saltar 1 byte extra
+      i++;
     }
   }
   return result;
 }
 
-String sanitizeLogValue(String value) {
+String sanitizeLogValue(const String& input) {
+  String value = input;
   value.replace('\r', ' ');
   value.replace('\n', ' ');
   value.replace('|', '/');
@@ -256,8 +299,11 @@ public:
   void onWrite(NimBLECharacteristic* pChar, NimBLEConnInfo& connInfo) override {
     NimBLEAttValue value = pChar->getValue();
     if (value.length() > 0) {
-      receivedData = String((char*)value.data(), value.length());
-      newData = true;
+      if (xSemaphoreTake(rxMutex, portMAX_DELAY)) {
+        receivedData = String((char*)value.data(), value.length());
+        newData = true;
+        xSemaphoreGive(rxMutex);
+      }
     }
   }
 };
@@ -267,17 +313,24 @@ MyCallbacks* callbacks = nullptr;
 // ==================== BUZZER ====================
 void beep(int ms) {
   digitalWrite(BUZZER_PIN, HIGH);
-  delay(ms);
-  digitalWrite(BUZZER_PIN, LOW);
+  beepEndTime = millis() + ms;
+  beepActive = true;
+}
+
+void updateBeep() {
+  if (beepActive && millis() >= beepEndTime) {
+    digitalWrite(BUZZER_PIN, LOW);
+    beepActive = false;
+  }
 }
 
 // Melodía de inicio tipo Mario Bros
 void playStartupMelody() {
   // Notas: E5, E5, E5, C5, E5, G5, G4
-  int melody[] = {659, 659, 659, 523, 659, 784, 392};
-  int durations[] = {150, 150, 150, 150, 150, 300, 300};
-  int pauses[] = {130, 130, 200, 100, 180, 200, 0};
-  
+  int melody[] = { 659, 659, 659, 523, 659, 784, 392 };
+  int durations[] = { 150, 150, 150, 150, 150, 300, 300 };
+  int pauses[] = { 130, 130, 200, 100, 180, 200, 0 };
+
   for (int i = 0; i < 7; i++) {
     tone(BUZZER_PIN, melody[i], durations[i]);
     delay(durations[i] + pauses[i]);
@@ -286,22 +339,23 @@ void playStartupMelody() {
 }
 
 // ==================== PROCESAMIENTO ====================
-void processMessage(String msg) {
+void processMessage(const String& rawMsg) {
+  String msg = rawMsg;
   msg.trim();
-  
+
   // Eliminar corchetes si existen
   if (msg.startsWith("[")) msg = msg.substring(1);
   if (msg.endsWith("]")) msg = msg.substring(0, msg.length() - 1);
-  
+
   Serial.println("RX: " + msg);
-  
+
   // Evitar procesar el mismo mensaje dos veces
   if (msg == lastProcessedMsg) return;
   lastProcessedMsg = msg;
 
   int p = msg.indexOf('|');
   String cmd = (p > 0) ? msg.substring(0, p) : msg;
-  
+
   if (cmd == "NAV") {
     // Formato: NAV|icono|distancia|calle|eta
     int p1 = msg.indexOf('|');
@@ -317,10 +371,11 @@ void processMessage(String msg) {
     if (p1 > 0 && p2 > p1) {
       icon = msg.substring(p1 + 1, p2);
       distance = (p3 > p2) ? msg.substring(p2 + 1, p3) : msg.substring(p2 + 1);
-      street = (p3 > p2 && p4 > p3) ? msg.substring(p3 + 1, p4) : (p3 > p2) ? msg.substring(p3 + 1) : "";
+      street = (p3 > p2 && p4 > p3) ? msg.substring(p3 + 1, p4) : (p3 > p2) ? msg.substring(p3 + 1)
+                                                                            : "";
       eta = (p4 > p3) ? msg.substring(p4 + 1) : "";
       parsed = true;
-      
+
       // Si algún valor contiene % (variable Tasker no resuelta), mostrar "-"
       if (distance.indexOf('%') >= 0) distance = "";
       if (street.indexOf('%') >= 0) street = "";
@@ -329,14 +384,20 @@ void processMessage(String msg) {
       distanceValid = distance.length() > 0;
     }
 
+    Serial.println("NAV: icono=" + icon + " distancia=" + distance + " calle=" + street + " eta=" + eta);
     logNavNotification(msg, parsed, icon, distance, street, eta);
 
     if (parsed) {
       if (icon.length() > 0) {
-        navIcon = icon;
-      } else if (eta.startsWith("0 min")) {
-        // Sin icono resuelto (%antitle vacío) y ETA = 0 min → icono de llegada
-        navIcon = "1608d2493a2650b2aa05f0f11588888";
+        int lastUnderscore = icon.lastIndexOf('_');
+        if (lastUnderscore >= 0 && lastUnderscore < (int)icon.length() - 1) {
+          navIcon = icon.substring(lastUnderscore + 1);
+        } else {
+          navIcon = icon;
+        }
+        if (navIcon == "-1834306968") {
+          navIcon = "1608d2493a2650b2aa05f0f11588888";
+        }
       }
       if (distanceValid) {
         navDistance = distance;
@@ -347,21 +408,20 @@ void processMessage(String msg) {
     navActive = true;
     currentState = STATE_NAVIGATION;
     beep(50);
-  }
-  else if (cmd == "TIME") {
+  } else if (cmd == "TIME") {
     int p1 = msg.indexOf('|');
     int p2 = msg.indexOf('|', p1 + 1);
-    
+
     if (p1 > 0 && p2 > p1) {
       String dateStr = msg.substring(p1 + 1, p2);
       String timeStr = msg.substring(p2 + 1);
-      
+
       dateStr.replace("-", "/");
       timeStr.replace(".", ":");
-      
+
       int ds1 = dateStr.indexOf('/');
       int ds2 = dateStr.indexOf('/', ds1 + 1);
-      
+
       if (ds1 > 0 && ds2 > ds1) {
         timeInfo.tm_mday = dateStr.substring(0, ds1).toInt();
         timeInfo.tm_mon = dateStr.substring(ds1 + 1, ds2).toInt() - 1;
@@ -369,10 +429,10 @@ void processMessage(String msg) {
         if (year < 100) year += 2000;
         timeInfo.tm_year = year - 1900;
       }
-      
+
       int ts1 = timeStr.indexOf(':');
       int ts2 = (ts1 > 0) ? timeStr.indexOf(':', ts1 + 1) : -1;
-      
+
       if (ts1 > 0) {
         // Formato HH:MM o HH:MM:SS
         timeInfo.tm_hour = timeStr.substring(0, ts1).toInt();
@@ -395,52 +455,47 @@ void processMessage(String msg) {
       mktime(&timeInfo);
       lastTimeUpdate = millis();  // Sincronizar el contador
       timeSet = true;
-      Serial.printf("TIME: %02d:%02d:%02d %02d/%02d/%04d\n", 
-        timeInfo.tm_hour, timeInfo.tm_min, timeInfo.tm_sec,
-        timeInfo.tm_mday, timeInfo.tm_mon + 1, timeInfo.tm_year + 1900);
+      Serial.printf("TIME: %02d:%02d:%02d %02d/%02d/%04d\n",
+                    timeInfo.tm_hour, timeInfo.tm_min, timeInfo.tm_sec,
+                    timeInfo.tm_mday, timeInfo.tm_mon + 1, timeInfo.tm_year + 1900);
     }
-  }
-  else if (cmd == "NOTIF") {
+  } else if (cmd == "NOTIF") {
     // Formato: NOTIF|app|remitente|mensaje|hora
     // Ejemplo: NOTIF|WhatsApp|Mamá|Hola, ¿cómo estás?|10:30
     int p1 = msg.indexOf('|');
     int p2 = msg.indexOf('|', p1 + 1);
     int p3 = msg.indexOf('|', p2 + 1);
     int p4 = msg.indexOf('|', p3 + 1);
-    
+
     if (p1 > 0 && p2 > p1 && p3 > p2) {
       notifApp = msg.substring(p1 + 1, p2);
       notifSender = msg.substring(p2 + 1, p3);
       notifMessage = (p4 > p3) ? msg.substring(p3 + 1, p4) : msg.substring(p3 + 1);
       notifTime = (p4 > p3) ? msg.substring(p4 + 1) : "";
-      
+
       // Si no hay hora, usar la hora actual
       if (notifTime.length() == 0 && timeSet) {
         char timeBuf[6];
         sprintf(timeBuf, "%02d:%02d", timeInfo.tm_hour, timeInfo.tm_min);
         notifTime = String(timeBuf);
       }
-      
+
       // Guardar estado actual para volver después
       stateBeforeNotif = currentState;
       notifStartTime = millis();
-      
+
       notifActive = true;
       currentState = STATE_NOTIFICATION;
       beep(100);
-      delay(50);
-      beep(100);  // Doble beep para notificación
       Serial.printf("NOTIF: %s - %s\n", notifApp.c_str(), notifSender.c_str());
     }
-  }
-  else if (cmd == "END") {
+  } else if (cmd == "END") {
     navActive = false;
     notifActive = false;
     currentState = STATE_CLOCK;
     beep(100);
     Serial.println("NAV: Fin");
-  }
-  else if (cmd == "DISMISS") {
+  } else if (cmd == "DISMISS") {
     notifActive = false;
     currentState = STATE_CLOCK;
   }
@@ -483,79 +538,19 @@ void showNavigation() {
   display.clearBuffer();
 
   // Área de la flecha: ajustada para centrar mejor
-  int arrowX = 2;   // Más a la izquierda
-  int arrowY = 6;   // Más arriba
-  
-  // Dibujar flecha según MD5 usando bitmaps
-  if (navIcon == "13e68aacc62531a385e2b3e9705e0701") {
-    // Flecha "continuar recto" (con cuerpo discontinuo)
-    display.drawXBMP(arrowX, arrowY, NAV_ARROW_W, NAV_ARROW_H, nav_arrow_ahead);
+  int arrowX = 2;  // Más a la izquierda
+  int arrowY = 6;  // Más arriba
+
+  // Buscar flecha en la tabla de iconos
+  bool found = false;
+  for (int i = 0; i < NAV_ARROW_TABLE_SIZE; i++) {
+    if (navIcon == navArrowTable[i].md5) {
+      display.drawXBMP(arrowX, arrowY, NAV_ARROW_W, NAV_ARROW_H, navArrowTable[i].bitmap);
+      found = true;
+      break;
+    }
   }
-  else if (navIcon == "3cc9cfaca8339431dfa25b4d26337d38") {
-    // Flecha "recta continua"
-    display.drawXBMP(arrowX, arrowY, NAV_ARROW_W, NAV_ARROW_H, nav_arrow_straight);
-  }
-  else if (navIcon == "1608d2493a2650b2aa05f0f11588d8be") {
-    // Flecha "girar derecha"
-    display.drawXBMP(arrowX, arrowY, NAV_ARROW_W, NAV_ARROW_H, nav_arrow_right);
-  }
-  else if (navIcon == "f467a04ac3ffa41cbce03096b28bd44b") {
-    // Flecha "girar leve izquierda"
-    display.drawXBMP(arrowX, arrowY, NAV_ARROW_W, NAV_ARROW_H, nav_arrow_left_light);
-  }
-  else if (navIcon == "0ad898f6410fe51971fe1b7159994f26") {
-    // Flecha "girar izquierda"
-    display.drawXBMP(arrowX, arrowY, NAV_ARROW_W, NAV_ARROW_H, nav_arrow_left);
-  }
-  else if (navIcon == "5710fb9ddabf6d18b95e424783ca8fae") {
-    // Flecha "girar leve derecha"
-    display.drawXBMP(arrowX, arrowY, NAV_ARROW_W, NAV_ARROW_H, nav_arrow_right_light);
-  }
-  else if (navIcon == "627c26a2d87e696a2b73d624145235a8") {
-    // Flecha "rotonda con salida izquierda"
-    display.drawXBMP(arrowX, arrowY, NAV_ARROW_W, NAV_ARROW_H, nav_arrow_round_left);
-  }
-  else if (navIcon == "356e3bf9bdb7f69a77e845464f489aba") {
-    // Flecha "rotonda con salida arriba-izquierda"
-    display.drawXBMP(arrowX, arrowY, NAV_ARROW_W, NAV_ARROW_H, nav_arrow_round_up_left);
-  }
-  else if (navIcon == "a294573bb87f9b91ac109ca1feb60253") {
-    // Flecha "rotonda con salida arriba-derecha"
-    display.drawXBMP(arrowX, arrowY, NAV_ARROW_W, NAV_ARROW_H, nav_arrow_round_up_right);
-  }
-  else if (navIcon == "8e35ee07dd4429bedab970ddae62577c") {
-    // Flecha "rotonda con salida abajo-derecha"
-    display.drawXBMP(arrowX, arrowY, NAV_ARROW_W, NAV_ARROW_H, nav_arrow_round_down_right);
-  }
-  else if (navIcon == "aabc87341d29ca80ce62a5d35926bfa7") {
-    // Flecha "rotonda con salida abajo-izquierda"
-    display.drawXBMP(arrowX, arrowY, NAV_ARROW_W, NAV_ARROW_H, nav_arrow_round_down_left);
-  }
-  else if (navIcon == "04ccb66fe89793824169db323392aeae") {
-    // Flecha "recto con dos carriles"
-    display.drawXBMP(arrowX, arrowY, NAV_ARROW_W, NAV_ARROW_H, nav_arrow_ahead_2);
-  }
-  else if (navIcon == "9dd54fb607c8a7b11c4cf98adf8d5d4d") {
-    // Flecha "giro a leve derecha 2"
-    display.drawXBMP(arrowX, arrowY, NAV_ARROW_W, NAV_ARROW_H, nav_arrow_right_light_2);
-  }
-  else if (navIcon == "4373638104f4cc57e201b63157aedacc") {
-    // Flecha "giro a leve izquierda 2"
-    display.drawXBMP(arrowX, arrowY, NAV_ARROW_W, NAV_ARROW_H, nav_arrow_left_light_2);
-  }
-  else if (navIcon == "c61a34040606ee47fda0f67864f6dcf0") {
-    // Flecha "Rotonda cambio de sentido"
-    display.drawXBMP(arrowX, arrowY, NAV_ARROW_W, NAV_ARROW_H, nav_arrow_round);
-  }
-  else if (navIcon == "19ff9ca1c8a743205da0e893c65bcbbe") {
-    // Flecha "Giro brusco derecha"
-    display.drawXBMP(arrowX, arrowY, NAV_ARROW_W, NAV_ARROW_H, nav_arrow_right_hard);
-  }
-  else if (navIcon == "1608d2493a2650b2aa05f0f11588888") {
-    // Icono de llegada (ETA = 0 min, sin icono resuelto en %antitle)
-    display.drawXBMP(arrowX, arrowY, NAV_ARROW_W, NAV_ARROW_H, nav_arrow_arrival);
-  }
-  else {
+  if (!found) {
     // MD5 no reconocido - mostrar "-" para identificarlo
     display.setFont(u8g2_font_ncenB24_tr);
     display.drawStr(arrowX + 8, arrowY + 36, "-");
@@ -567,16 +562,16 @@ void showNavigation() {
   int xText = 36;
   int yText = 16;
   int lineHeight = 14;
-  
+
   String street = utf8ToLatin1(navStreet);  // Convertir acentos
   int currentLine = 0;
   int maxLines = 3;
-  
+
   while (street.length() > 0 && currentLine < maxLines) {
     String line = "";
     int lastSpace = -1;
-    
-    for (int i = 0; i < street.length(); i++) {
+
+    for (int i = 0; i < (int)street.length(); i++) {
       String testLine = line + street.charAt(i);
       if (display.getStrWidth(testLine.c_str()) > maxWidth) {
         if (lastSpace > 0) {
@@ -590,11 +585,11 @@ void showNavigation() {
       }
       if (street.charAt(i) == ' ') lastSpace = i;
       line = testLine;
-      if (i == street.length() - 1) {
+      if (i == (int)street.length() - 1) {
         street = "";
       }
     }
-    
+
     display.drawStr(xText, yText + (currentLine * lineHeight), line.c_str());
     currentLine++;
   }
@@ -626,18 +621,18 @@ void showNotification() {
   display.clearBuffer();
   // Línea separadora superior
   display.drawHLine(0, 3, 128);
-  
+
   // Nombre del remitente (grande, arriba)
   display.setFont(u8g2_font_ncenB12_te);
   String sender = utf8ToLatin1(notifSender);
-  
+
   // Truncar si es muy largo
   int maxSenderWidth = 126;
   while (display.getStrWidth(sender.c_str()) > maxSenderWidth && sender.length() > 0) {
     sender = sender.substring(0, sender.length() - 1);
   }
   display.drawStr(1, 24, sender.c_str());
-  
+
   // Mensaje (más pequeño, multilínea)
   display.setFont(u8g2_font_ncenB08_te);
   String message = utf8ToLatin1(notifMessage);
@@ -647,11 +642,11 @@ void showNotification() {
   int lineHeight = 10;
   int currentLine = 0;
   int maxLines = 2;  // 2 líneas para el mensaje
-  
+
   while (message.length() > 0 && currentLine < maxLines) {
     String line = "";
     int lastSpace = -1;
-    
+
     for (int i = 0; i < (int)message.length(); i++) {
       String testLine = line + message.charAt(i);
       if (display.getStrWidth(testLine.c_str()) > maxWidth) {
@@ -670,32 +665,32 @@ void showNotification() {
         message = "";
       }
     }
-    
+
     display.drawStr(xText, yText + (currentLine * lineHeight), line.c_str());
     currentLine++;
   }
-  
+
   // Línea separadora inferior
   display.drawHLine(0, 53, 128);
-  
+
   // Nombre de la app (abajo izquierda) y hora (abajo derecha)
   display.setFont(u8g2_font_ncenB08_te);
   String app = utf8ToLatin1(notifApp);
   display.drawStr(1, 63, app.c_str());
-  
+
   // Hora a la derecha
   if (notifTime.length() > 0) {
     int timeWidth = display.getStrWidth(notifTime.c_str());
     display.drawStr(127 - timeWidth, 63, notifTime.c_str());
   }
-  
+
   // Indicador de conexión
   if (deviceConnected) {
     display.drawDisc(120, 5, 3);
   } else {
     display.drawCircle(120, 5, 3);
   }
-  
+
   display.sendBuffer();
 }
 
@@ -731,14 +726,12 @@ void setupBLE() {
   // Característica TX (para enviar notificaciones al teléfono)
   pCharTX = pService->createCharacteristic(
     CHAR_UUID_TX,
-    NIMBLE_PROPERTY::NOTIFY | NIMBLE_PROPERTY::READ
-  );
+    NIMBLE_PROPERTY::NOTIFY | NIMBLE_PROPERTY::READ);
 
   // Característica RX (para recibir datos del teléfono)
   pCharRX = pService->createCharacteristic(
     CHAR_UUID_RX,
-    NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR
-  );
+    NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR);
   pCharRX->setCallbacks(callbacks);
 
   pService->start();
@@ -756,17 +749,24 @@ void setupBLE() {
 // ==================== SETUP ====================
 void setup() {
   Serial.begin(115200);
+  delay(500);
   Serial.setTimeout(50);
-  delay(1000);
   Serial.println("\n=== SIDEBIKE " VERSION " ===");
+  Serial.flush();
+  delay(100);
+  Serial.println("Comandos: LOG, LOGCLEAR, LOGSIZE");
+  Serial.flush();
+  delay(100);
 
   pinMode(TOUCH_PIN, INPUT);
   pinMode(BUZZER_PIN, OUTPUT);
   digitalWrite(BUZZER_PIN, LOW);
 
+  rxMutex = xSemaphoreCreateMutex();
+
   Wire.begin(SDA_PIN, SCL_PIN);
   display.begin();
-  
+
   // Configurar zona horaria España (CET/CEST con cambio automático)
   setenv("TZ", "CET-1CEST,M3.5.0,M10.5.0/3", 1);
   tzset();
@@ -782,17 +782,17 @@ void setup() {
   // Dimensiones del icono del casco: 60x60px
   const int HELMET_W = 60;
   const int HELMET_H = 60;
-  
+
   // Posición inicial: centrado en pantalla (128x64)
   int helmetX = (128 - HELMET_W) / 2;  // 34
   int helmetY = (64 - HELMET_H) / 2;   // 2
-  
+
   // 1. Mostrar casco centrado
   display.clearBuffer();
   display.drawXBMP(helmetX, helmetY, HELMET_W, HELMET_H, epd_bitmap_icono_casco);
   display.sendBuffer();
   delay(800);  // Pausa para ver el casco centrado
-  
+
   // 2. Animar casco hacia la izquierda
   int targetX = 2;  // Posición final del casco a la izquierda
   for (int x = helmetX; x >= targetX; x -= 4) {
@@ -801,22 +801,22 @@ void setup() {
     display.sendBuffer();
     delay(20);  // Velocidad de la animación
   }
-  
+
   // 3. Mostrar texto SIDEBIKE y versión a la derecha
   display.clearBuffer();
   display.drawXBMP(targetX, helmetY, HELMET_W, HELMET_H, epd_bitmap_icono_casco);
-  
+
   // Texto "SIDEBIKE" a la derecha del casco
   display.setFont(u8g2_font_ncenB08_tr);
   int textX = targetX + HELMET_W + 4;  // 66
   display.drawStr(textX, 30, "SIDEBIKE");
-  
+
   // Versión debajo de SIDEBIKE
   display.setFont(u8g2_font_ncenB08_tr);
   display.drawStr(textX + 10, 48, VERSION);
-  
+
   display.sendBuffer();
-  
+
   playStartupMelody();  // Melodía tipo Mario Bros
   delay(500);
 
@@ -830,6 +830,8 @@ void setup() {
 // ==================== LOOP ====================
 void loop() {
   handleSerialCommands();
+  updateBeep();
+
   // Actualizar tiempo en segundo plano (siempre, independiente de la pantalla)
   if (timeSet && (millis() - lastTimeUpdate >= 1000)) {
     lastTimeUpdate = millis();
@@ -845,7 +847,7 @@ void loop() {
     // NO detenemos advertising - siempre permitimos reconexión
     Serial.println("Ventana de pairing cerrada, pero advertising continua");
   }
-  
+
   // Timeout de notificación - volver al estado anterior después de 5 segundos
   if (currentState == STATE_NOTIFICATION && (millis() - notifStartTime > 5000)) {
     notifActive = false;
@@ -857,18 +859,25 @@ void loop() {
     }
     Serial.println(">>> Timeout notificación, volviendo a estado anterior");
   }
-  
+
   // Si no estamos conectados, asegurarnos de que advertising está activo
   if (!deviceConnected && !NimBLEDevice::getAdvertising()->isAdvertising()) {
     NimBLEDevice::startAdvertising();
     Serial.println("Reiniciando advertising...");
   }
 
-  // Procesar datos recibidos (del callback)
+  // Procesar datos recibidos (del callback, protegido con mutex)
   if (newData) {
-    newData = false;
-    processMessage(receivedData);
-    receivedData = "";
+    String dataCopy;
+    if (xSemaphoreTake(rxMutex, portMAX_DELAY)) {
+      dataCopy = receivedData;
+      receivedData = "";
+      newData = false;
+      xSemaphoreGive(rxMutex);
+    }
+    if (dataCopy.length() > 0) {
+      processMessage(dataCopy);
+    }
   }
 
   // Polling de la característica RX (backup - solo si no hubo callback)
@@ -889,19 +898,18 @@ void loop() {
   static unsigned long touchStartTime = 0;
   static bool longPressHandled = false;
   const unsigned long LONG_PRESS_MS = 1500;  // 1.5 segundos para toque prolongado
-  
+
   bool touch = digitalRead(TOUCH_PIN);
-  
+
   if (touch && !lastTouch) {
     // Inicio del toque
     touchStartTime = millis();
     longPressHandled = false;
-  }
-  else if (touch && lastTouch) {
+  } else if (touch && lastTouch) {
     // Toque mantenido - verificar si es prolongado
     if (!longPressHandled && (millis() - touchStartTime >= LONG_PRESS_MS)) {
       longPressHandled = true;
-      
+
       // Toque prolongado: activar emparejamiento si no está conectado
       if (!deviceConnected) {
         Serial.println(">>> TOQUE PROLONGADO - Activando modo emparejamiento");
@@ -915,23 +923,22 @@ void loop() {
         beep(50);
       }
     }
-  }
-  else if (!touch && lastTouch) {
+  } else if (!touch && lastTouch) {
     // Fin del toque - si fue corto, procesar como tap normal
     if (!longPressHandled && (millis() - touchStartTime < LONG_PRESS_MS)) {
       beep(30);
-        if (currentState == STATE_PAIRING) {
-          pairingMode = false;
-          if (!deviceConnected) NimBLEDevice::stopAdvertising();
-          currentState = STATE_CLOCK;
-        } else if (currentState == STATE_NOTIFICATION) {
-          // Descartar notificación con toque
-          notifActive = false;
-          currentState = STATE_CLOCK;
-        } else if (notifActive && currentState == STATE_CLOCK) {
-          // Volver a ver la notificación
-          currentState = STATE_NOTIFICATION;
-        } else if (navActive && currentState == STATE_CLOCK) {
+      if (currentState == STATE_PAIRING) {
+        pairingMode = false;
+        if (!deviceConnected) NimBLEDevice::stopAdvertising();
+        currentState = STATE_CLOCK;
+      } else if (currentState == STATE_NOTIFICATION) {
+        // Descartar notificación con toque
+        notifActive = false;
+        currentState = STATE_CLOCK;
+      } else if (notifActive && currentState == STATE_CLOCK) {
+        // Volver a ver la notificación
+        currentState = STATE_NOTIFICATION;
+      } else if (navActive && currentState == STATE_CLOCK) {
         currentState = STATE_NAVIGATION;
       } else if (currentState == STATE_NAVIGATION) {
         currentState = STATE_CLOCK;
