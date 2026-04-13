@@ -749,7 +749,7 @@ void setupBLE() {
 // ==================== SETUP ====================
 void setup() {
   Serial.begin(115200);
-  delay(500);
+  delay(1000);
   Serial.setTimeout(50);
   Serial.println("\n=== SIDEBIKE " VERSION " ===");
   Serial.flush();
